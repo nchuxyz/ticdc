@@ -47,6 +47,7 @@ type AvroSchemaManager struct {
 
 	cacheRWLock sync.RWMutex
 	cache       map[string]*schemaCacheEntry
+	Topic       string
 }
 
 type schemaCacheEntry struct {
@@ -128,14 +129,14 @@ func (m *AvroSchemaManager) Register(ctx context.Context, tableName model.TableN
 		return 0, errors.Annotate(
 			cerror.WrapError(cerror.ErrAvroSchemaAPIError, err), "Could not marshal request to the Registry")
 	}
-	uri := m.registryURL + "/subjects/" + url.QueryEscape(m.tableNameToSchemaSubject(tableName)) + "/versions"
+	uri := m.registryURL + "/subjects/" + url.QueryEscape(m.topicToSchemaSubject()) + "/versions"
 	log.Debug("Registering schema", zap.String("uri", uri), zap.ByteString("payload", payload))
 
 	req, err := http.NewRequestWithContext(ctx, "POST", uri, bytes.NewReader(payload))
 	if err != nil {
 		return 0, cerror.ErrAvroSchemaAPIError.GenWithStackByArgs()
 	}
-	req.Header.Add("Accept", "application/vnd.schemaregistry.v1+json")
+	req.Header.Add("Content-Type", "application/vnd.schemaregistry.v1+json")
 	resp, err := httpRetry(ctx, m.credential, req, false)
 	if err != nil {
 		return 0, err
@@ -198,7 +199,7 @@ func (m *AvroSchemaManager) Lookup(ctx context.Context, tableName model.TableNam
 		zap.String("key", key),
 		zap.Uint64("tiSchemaID", tiSchemaID))
 
-	uri := m.registryURL + "/subjects/" + url.QueryEscape(m.tableNameToSchemaSubject(tableName)) + "/versions/latest"
+	uri := m.registryURL + "/subjects/" + url.QueryEscape(m.topicToSchemaSubject()) + "/versions/latest"
 	log.Debug("Querying for latest schema", zap.String("uri", uri))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
@@ -326,7 +327,7 @@ func (m *AvroSchemaManager) GetCachedOrRegister(ctx context.Context, tableName m
 // Exported for testing.
 // NOT USED for now, reserved for future use.
 func (m *AvroSchemaManager) ClearRegistry(ctx context.Context, tableName model.TableName) error {
-	uri := m.registryURL + "/subjects/" + url.QueryEscape(m.tableNameToSchemaSubject(tableName))
+	uri := m.registryURL + "/subjects/" + url.QueryEscape(m.topicToSchemaSubject())
 	req, err := http.NewRequestWithContext(ctx, "DELETE", uri, nil)
 	if err != nil {
 		log.Error("Could not construct request for clearRegistry", zap.String("uri", uri))
@@ -405,4 +406,8 @@ func httpRetry(ctx context.Context, credential *security.Credential, r *http.Req
 func (m *AvroSchemaManager) tableNameToSchemaSubject(tableName model.TableName) string {
 	// We should guarantee unique names for subjects
 	return tableName.Schema + "_" + tableName.Table + m.subjectSuffix
+}
+
+func (m *AvroSchemaManager) topicToSchemaSubject() string {
+	return m.Topic + m.subjectSuffix
 }
