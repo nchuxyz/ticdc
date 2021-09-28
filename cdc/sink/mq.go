@@ -60,7 +60,7 @@ type mqSink struct {
 }
 
 func newMqSink(
-	ctx context.Context, credential *security.Credential, mqProducer producer.Producer,
+	ctx context.Context, credential *security.Credential, mqProducer producer.Producer, topic string,
 	filter *filter.Filter, config *config.ReplicaConfig, opts map[string]string, errCh chan error,
 ) (*mqSink, error) {
 	partitionNum := mqProducer.GetPartitionNum()
@@ -83,7 +83,7 @@ func newMqSink(
 	protocol.FromString(config.Sink.Protocol)
 
 	newEncoder := codec.NewEventBatchEncoder(protocol)
-	if protocol == codec.ProtocolAvro {
+	if protocol == codec.ProtocolAvro || protocol == codec.ProtocolDebeziumAvro {
 		registryURI, ok := opts["registry"]
 		if !ok {
 			return nil, cerror.ErrPrepareAvroFailed.GenWithStack(`Avro protocol requires parameter "registry"`)
@@ -94,18 +94,34 @@ func newMqSink(
 				cerror.WrapError(cerror.ErrPrepareAvroFailed, err),
 				"Could not create Avro schema manager for message keys")
 		}
+		keySchemaManager.Topic = topic
 		valueSchemaManager, err := codec.NewAvroSchemaManager(ctx, credential, registryURI, "-value")
 		if err != nil {
 			return nil, errors.Annotate(
 				cerror.WrapError(cerror.ErrPrepareAvroFailed, err),
 				"Could not create Avro schema manager for message values")
 		}
+		valueSchemaManager.Topic = topic
 		newEncoder1 := newEncoder
 		newEncoder = func() codec.EventBatchEncoder {
-			avroEncoder := newEncoder1().(*codec.AvroEventBatchEncoder)
-			avroEncoder.SetKeySchemaManager(keySchemaManager)
-			avroEncoder.SetValueSchemaManager(valueSchemaManager)
-			avroEncoder.SetTimeZone(util.TimezoneFromCtx(ctx))
+			avroEncoder := newEncoder1()
+			if encoder, ok := avroEncoder.(*codec.DebeziumAvroEventBatchEncoder); ok {
+				serverName, ok := opts["servername"]
+				if !ok {
+					log.Fatal(`Debezium protocol requires parameter "servername"`)
+				}
+				if !config.EnableOldValue {
+					log.Fatal("Debezium protocol requires old value to be enabled")
+				}
+				encoder.SetServerName(serverName)
+				encoder.SetKeySchemaManager(keySchemaManager)
+				encoder.SetValueSchemaManager(valueSchemaManager)
+				encoder.SetTimeZone(util.TimezoneFromCtx(ctx))
+			} else if encoder, ok := avroEncoder.(*codec.AvroEventBatchEncoder); ok {
+				encoder.SetKeySchemaManager(keySchemaManager)
+				encoder.SetValueSchemaManager(valueSchemaManager)
+				encoder.SetTimeZone(util.TimezoneFromCtx(ctx))
+			}
 			return avroEncoder
 		}
 	} else if (protocol == codec.ProtocolCanal || protocol == codec.ProtocolCanalJSON) && !config.EnableOldValue {
@@ -501,7 +517,7 @@ func newKafkaSaramaSink(ctx context.Context, sinkURI *url.URL, filter *filter.Fi
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	sink, err := newMqSink(ctx, config.Credential, producer, filter, replicaConfig, opts, errCh)
+	sink, err := newMqSink(ctx, config.Credential, producer, topic, filter, replicaConfig, opts, errCh)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -530,7 +546,10 @@ func newPulsarSink(ctx context.Context, sinkURI *url.URL, filter *filter.Filter,
 	// For now, it's a place holder. Avro format have to make connection to Schema Registery,
 	// and it may needs credential.
 	credential := &security.Credential{}
-	sink, err := newMqSink(ctx, credential, producer, filter, replicaConfig, opts, errCh)
+	topic := strings.TrimFunc(sinkURI.Path, func(r rune) bool {
+		return r == '/'
+	})
+	sink, err := newMqSink(ctx, credential, producer, topic, filter, replicaConfig, opts, errCh)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}

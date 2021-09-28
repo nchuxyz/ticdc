@@ -141,6 +141,7 @@ const (
 	ProtocolDefault Protocol = iota
 	ProtocolCanal
 	ProtocolAvro
+	ProtocolDebeziumAvro
 	ProtocolMaxwell
 	ProtocolCanalJSON
 )
@@ -154,6 +155,8 @@ func (p *Protocol) FromString(protocol string) {
 		*p = ProtocolCanal
 	case "avro":
 		*p = ProtocolAvro
+	case "debezium-avro":
+		*p = ProtocolDebeziumAvro
 	case "maxwell":
 		*p = ProtocolMaxwell
 	case "canal-json":
@@ -173,6 +176,8 @@ func NewEventBatchEncoder(p Protocol) func() EventBatchEncoder {
 		return NewCanalEventBatchEncoder
 	case ProtocolAvro:
 		return NewAvroEventBatchEncoder
+	case ProtocolDebeziumAvro:
+		return NewDebeziumAvroEventBatchEncoder
 	case ProtocolMaxwell:
 		return NewMaxwellEventBatchEncoder
 	case ProtocolCanalJSON:
