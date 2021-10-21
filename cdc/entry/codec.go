@@ -162,20 +162,22 @@ func decodeMetaKey(ek []byte) (meta, error) {
 }
 
 // decodeRow decodes a byte slice into datums with a existing row map.
-func decodeRow(b []byte, recordID int64, tableInfo *model.TableInfo, tz *time.Location) (map[int64]types.Datum, error) {
+func decodeRow(b []byte, recordID int64, tableInfo *model.TableInfo, tz *time.Location, row map[int64]types.Datum) (map[int64]types.Datum, error) {
 	if len(b) == 0 {
 		return map[int64]types.Datum{}, nil
 	}
 	if rowcodec.IsNewFormat(b) {
-		return decodeRowV2(b, recordID, tableInfo, tz)
+		return decodeRowV2(b, recordID, tableInfo, tz, row)
 	}
-	return decodeRowV1(b, recordID, tableInfo, tz)
+	return decodeRowV1(b, recordID, tableInfo, tz, row)
 }
 
 // decodeRowV1 decodes value data using old encoding format.
 // Row layout: colID1, value1, colID2, value2, .....
-func decodeRowV1(b []byte, recordID int64, tableInfo *model.TableInfo, tz *time.Location) (map[int64]types.Datum, error) {
-	row := make(map[int64]types.Datum)
+func decodeRowV1(b []byte, recordID int64, tableInfo *model.TableInfo, tz *time.Location, row map[int64]types.Datum) (map[int64]types.Datum, error) {
+	if row == nil {
+		row = make(map[int64]types.Datum)
+	}
 	if len(b) == 1 && b[0] == codec.NilFlag {
 		b = b[1:]
 	}
@@ -230,10 +232,10 @@ func decodeRowV1(b []byte, recordID int64, tableInfo *model.TableInfo, tz *time.
 // decodeRowV2 decodes value data using new encoding format.
 // Ref: https://github.com/pingcap/tidb/pull/12634
 //      https://github.com/pingcap/tidb/blob/master/docs/design/2018-07-19-row-format.md
-func decodeRowV2(data []byte, recordID int64, tableInfo *model.TableInfo, tz *time.Location) (map[int64]types.Datum, error) {
+func decodeRowV2(data []byte, recordID int64, tableInfo *model.TableInfo, tz *time.Location, row map[int64]types.Datum) (map[int64]types.Datum, error) {
 	handleColID, reqCols := tableInfo.GetRowColInfos()
 	decoder := rowcodec.NewDatumMapDecoder(reqCols, handleColID, tz)
-	datums, err := decoder.DecodeToDatumMap(data, recordID, nil)
+	datums, err := decoder.DecodeToDatumMap(data, recordID, row)
 	if err != nil {
 		return datums, cerror.WrapError(cerror.ErrDecodeRowToDatum, err)
 	}

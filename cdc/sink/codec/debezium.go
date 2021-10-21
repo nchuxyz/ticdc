@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/linkedin/goavro/v2"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/parser/mysql"
@@ -26,6 +27,8 @@ import (
 type DebeziumAvroEventBatchEncoder struct {
 	*AvroEventBatchEncoder
 	serverName string
+	// avoid too much malloc
+	avroStructCache map[int64]dbzEvent
 }
 
 // creates an DebeziumAvroEventBatchEncoder
@@ -36,7 +39,8 @@ func NewDebeziumAvroEventBatchEncoder() EventBatchEncoder {
 			keySchemaManager:   nil,
 			resultBuf:          make([]*MQMessage, 0, 4096),
 		},
-		serverName: "",
+		serverName:      "",
+		avroStructCache: make(map[int64]dbzEvent),
 	}
 }
 
@@ -56,7 +60,7 @@ func (d *DebeziumAvroEventBatchEncoder) AppendRowChangedEvent(e *model.RowChange
 	keySchemaManager := d.keySchemaManager
 	valueSchemaManager := d.valueSchemaManager
 	if e.IsDelete() {
-		result, err := convertToDbzEvent(e)
+		result, err := d.convertToDbzEvent(e)
 		if err != nil {
 			return EncoderNoOperation, err
 		}
@@ -68,7 +72,7 @@ func (d *DebeziumAvroEventBatchEncoder) AppendRowChangedEvent(e *model.RowChange
 
 		d.resultBuf = append(d.resultBuf, msg)
 	} else if e.PreColumns == nil {
-		result, err := convertToDbzEvent(e)
+		result, err := d.convertToDbzEvent(e)
 		if err != nil {
 			return EncoderNoOperation, err
 		}
@@ -80,7 +84,7 @@ func (d *DebeziumAvroEventBatchEncoder) AppendRowChangedEvent(e *model.RowChange
 
 		d.resultBuf = append(d.resultBuf, msg)
 	} else {
-		result, err := convertToDbzEvent(e)
+		result, err := d.convertToDbzEvent(e)
 		if err != nil {
 			return EncoderNoOperation, err
 		}
@@ -116,6 +120,9 @@ func (d *DebeziumAvroEventBatchEncoder) AppendRowChangedEvent(e *model.RowChange
 			evlp["after"] = map[string]interface{}{avroKey: result.values}
 
 			values, err := buildMsgValue(evlp, table, tableVersion, serverName, e, valueSchemaManager)
+			if err != nil {
+				return EncoderNoOperation, err
+			}
 			msg.Value = values
 
 			d.resultBuf = append(d.resultBuf, msg)
@@ -125,52 +132,64 @@ func (d *DebeziumAvroEventBatchEncoder) AppendRowChangedEvent(e *model.RowChange
 }
 
 type dbzEvent struct {
-	keys      map[string]interface{}
-	values    map[string]interface{}
-	preKeys   map[string]interface{}
-	preValues map[string]interface{}
-	pkCols    []*model.Column
-	prePkCols []*model.Column
-	pkUpdate  bool
+	keys         map[string]interface{}
+	values       map[string]interface{}
+	preKeys      map[string]interface{}
+	preValues    map[string]interface{}
+	pkCols       []*model.Column
+	prePkCols    []*model.Column
+	pkUpdate     bool
+	tableVersion uint64
 }
 
-func convertToDbzEvent(e *model.RowChangedEvent) (*dbzEvent, error) {
+func (d *DebeziumAvroEventBatchEncoder) convertToDbzEvent(e *model.RowChangedEvent) (*dbzEvent, error) {
+	cache, exist := d.avroStructCache[e.Table.TableID]
+	if !exist || cache.tableVersion < e.TableInfoVersion {
+		cache = dbzEvent{
+			keys:         make(map[string]interface{}),
+			values:       make(map[string]interface{}, len(e.Columns)),
+			preKeys:      make(map[string]interface{}),
+			preValues:    make(map[string]interface{}, len(e.PreColumns)),
+			tableVersion: e.TableInfoVersion,
+		}
+		d.avroStructCache[e.Table.TableID] = cache
+	}
+
 	if e.IsDelete() {
-		return rowToDbzEvent(e.PreColumns, true)
-	} else if e.PreColumns == nil {
-		return rowToDbzEvent(e.Columns, false)
-	} else {
-		pre, err := rowToDbzEvent(e.PreColumns, true)
+		err := rowToDbzEvent(e.PreColumns, true, &cache)
 		if err != nil {
 			return nil, err
 		}
-		result, err := rowToDbzEvent(e.Columns, false)
+	} else if e.PreColumns == nil {
+		err := rowToDbzEvent(e.Columns, false, &cache)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		err := rowToDbzEvent(e.PreColumns, true, &cache)
+		if err != nil {
+			return nil, err
+		}
+		err = rowToDbzEvent(e.Columns, false, &cache)
 		if err != nil {
 			return nil, err
 		}
 		// check pk update
 		var pkUpdate bool = false
-		if len(result.keys) != len(pre.preKeys) {
+		if len(cache.keys) != len(cache.preKeys) {
 			pkUpdate = true
 		} else {
-			for keyName, keyVal := range result.keys {
-				preKeyVal := pre.preKeys[keyName]
+			for keyName, keyVal := range cache.keys {
+				preKeyVal := cache.preKeys[keyName]
 				if !reflect.DeepEqual(keyVal, preKeyVal) {
 					pkUpdate = true
 					break
 				}
 			}
 		}
-		return &dbzEvent{
-			keys:      result.keys,
-			values:    result.values,
-			preKeys:   pre.preKeys,
-			preValues: pre.preValues,
-			pkCols:    result.pkCols,
-			prePkCols: pre.prePkCols,
-			pkUpdate:  pkUpdate,
-		}, nil
+		cache.pkUpdate = pkUpdate
 	}
+	return &cache, nil
 }
 
 type dbzAvroSchema struct {
@@ -574,6 +593,9 @@ func buildDeleteMsg(result *dbzEvent, table *model.TableName, tableVersion uint6
 	evlp["after"] = nil
 
 	values, err := buildMsgValue(evlp, table, tableVersion, serverName, e, valueSchemaManager)
+	if err != nil {
+		return nil, err
+	}
 	msg.Value = values
 	return msg, nil
 }
@@ -601,9 +623,15 @@ func buildInsertMsg(result *dbzEvent, table *model.TableName, tableVersion uint6
 	return msg, nil
 }
 
-func rowToDbzEvent(cols []*model.Column, isPre bool) (*dbzEvent, error) {
-	keys := make(map[string]interface{})
-	values := make(map[string]interface{}, len(cols))
+func rowToDbzEvent(cols []*model.Column, isPre bool, e *dbzEvent) error {
+	var keys, values map[string]interface{}
+	if isPre {
+		keys = e.preKeys
+		values = e.preValues
+	} else {
+		keys = e.keys
+		values = e.values
+	}
 	pkCols := make([]*model.Column, 0)
 	for _, col := range cols {
 		if col == nil {
@@ -611,29 +639,20 @@ func rowToDbzEvent(cols []*model.Column, isPre bool) (*dbzEvent, error) {
 		}
 		data, typ, err := columnToDbzAvroNativeData(col)
 		if err != nil {
-			return nil, errors.Annotate(err, "DebeziumAvroEventBatchEncoder: converting to native failed")
+			return errors.Annotate(err, "DebeziumAvroEventBatchEncoder: converting to native failed")
 		}
 		if col.Flag.IsHandleKey() {
 			keys[col.Name] = data
 			values[col.Name] = data
 			pkCols = append(pkCols, col)
-			continue
+		} else {
+			values[col.Name] = goavro.NewUnion(typ, data)
 		}
-		values[col.Name] = map[string]interface{}{typ: data}
 	}
 	if isPre {
-		return &dbzEvent{
-			preKeys:   keys,
-			preValues: values,
-			prePkCols: pkCols,
-			pkUpdate:  false,
-		}, nil
+		e.prePkCols = pkCols
 	} else {
-		return &dbzEvent{
-			keys:     keys,
-			values:   values,
-			pkCols:   pkCols,
-			pkUpdate: false,
-		}, nil
+		e.pkCols = pkCols
 	}
+	return nil
 }
