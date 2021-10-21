@@ -262,11 +262,12 @@ func testMounterDisableOldValue(c *check.C, tc struct {
 	mounter.tz = time.Local
 	ctx := context.Background()
 
+	rowKVEntryCache := make(map[int64]*rowKVEntry)
 	mountAndCheckRowInTable := func(tableID int64, f func(key []byte, value []byte) *model.RawKVEntry) int {
 		var rows int
 		walkTableSpanInStore(c, store, tableID, func(key []byte, value []byte) {
 			rawKV := f(key, value)
-			row, err := mounter.unmarshalAndMountRowChanged(ctx, rawKV)
+			row, err := mounter.unmarshalAndMountRowChanged(ctx, rawKV, rowKVEntryCache)
 			c.Assert(err, check.IsNil)
 			if row == nil {
 				return

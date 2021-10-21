@@ -165,7 +165,7 @@ func decodeMetaKey(ek []byte) (meta, error) {
 }
 
 // decodeRow decodes a byte slice into datums with a existing row map.
-func decodeRow(b []byte, recordID kv.Handle, tableInfo *model.TableInfo, tz *time.Location) (map[int64]types.Datum, error) {
+func decodeRow(b []byte, recordID kv.Handle, tableInfo *model.TableInfo, tz *time.Location, row map[int64]types.Datum) (map[int64]types.Datum, error) {
 	if len(b) == 0 {
 		return map[int64]types.Datum{}, nil
 	}
@@ -173,9 +173,9 @@ func decodeRow(b []byte, recordID kv.Handle, tableInfo *model.TableInfo, tz *tim
 	var datums map[int64]types.Datum
 	var err error
 	if rowcodec.IsNewFormat(b) {
-		datums, err = decodeRowV2(b, reqCols, tz)
+		datums, err = decodeRowV2(b, reqCols, tz, row)
 	} else {
-		datums, err = decodeRowV1(b, tableInfo, tz)
+		datums, err = decodeRowV1(b, tableInfo, tz, row)
 	}
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -185,8 +185,10 @@ func decodeRow(b []byte, recordID kv.Handle, tableInfo *model.TableInfo, tz *tim
 
 // decodeRowV1 decodes value data using old encoding format.
 // Row layout: colID1, value1, colID2, value2, .....
-func decodeRowV1(b []byte, tableInfo *model.TableInfo, tz *time.Location) (map[int64]types.Datum, error) {
-	row := make(map[int64]types.Datum)
+func decodeRowV1(b []byte, tableInfo *model.TableInfo, tz *time.Location, row map[int64]types.Datum) (map[int64]types.Datum, error) {
+	if row == nil {
+		row = make(map[int64]types.Datum)
+	}
 	if len(b) == 1 && b[0] == codec.NilFlag {
 		b = b[1:]
 	}
@@ -233,9 +235,9 @@ func decodeRowV1(b []byte, tableInfo *model.TableInfo, tz *time.Location) (map[i
 // decodeRowV2 decodes value data using new encoding format.
 // Ref: https://github.com/pingcap/tidb/pull/12634
 //      https://github.com/pingcap/tidb/blob/master/docs/design/2018-07-19-row-format.md
-func decodeRowV2(data []byte, columns []rowcodec.ColInfo, tz *time.Location) (map[int64]types.Datum, error) {
+func decodeRowV2(data []byte, columns []rowcodec.ColInfo, tz *time.Location, row map[int64]types.Datum) (map[int64]types.Datum, error) {
 	decoder := rowcodec.NewDatumMapDecoder(columns, tz)
-	datums, err := decoder.DecodeToDatumMap(data, nil)
+	datums, err := decoder.DecodeToDatumMap(data, row)
 	if err != nil {
 		return datums, cerror.WrapError(cerror.ErrDecodeRowToDatum, err)
 	}

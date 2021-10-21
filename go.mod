@@ -68,3 +68,5 @@ require (
 	sigs.k8s.io/yaml v1.2.0 // indirect
 	upper.io/db.v3 v3.7.1+incompatible
 )
+
+replace github.com/linkedin/goavro/v2 v2.9.7 => github.com/nchuxyz/goavro/v2 v2.9.8-0.20211012101055-5e4790ae286f

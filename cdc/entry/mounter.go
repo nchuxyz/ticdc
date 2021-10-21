@@ -61,6 +61,8 @@ type rowKVEntry struct {
 	// or row data that does not contain any Datum.
 	RowExist    bool
 	PreRowExist bool
+
+	TableInfoVersion uint64
 }
 
 // Mounter is used to parse SQL events from KV events
@@ -116,6 +118,8 @@ func (m *mounterImpl) codecWorker(ctx context.Context, index int) error {
 	captureAddr := util.CaptureAddrFromCtx(ctx)
 	changefeedID := util.ChangefeedIDFromCtx(ctx)
 	metricMountDuration := mountDuration.WithLabelValues(captureAddr, changefeedID)
+	// avoid too much malloc
+	rowKVEntryCache := make(map[int64]*rowKVEntry)
 
 	for {
 		var pEvent *model.PolymorphicEvent
@@ -129,7 +133,7 @@ func (m *mounterImpl) codecWorker(ctx context.Context, index int) error {
 			continue
 		}
 		startTime := time.Now()
-		rowEvent, err := m.unmarshalAndMountRowChanged(ctx, pEvent.RawKV)
+		rowEvent, err := m.unmarshalAndMountRowChanged(ctx, pEvent.RawKV, rowKVEntryCache)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -164,7 +168,7 @@ func (m *mounterImpl) collectMetrics(ctx context.Context) {
 	}
 }
 
-func (m *mounterImpl) unmarshalAndMountRowChanged(ctx context.Context, raw *model.RawKVEntry) (*model.RowChangedEvent, error) {
+func (m *mounterImpl) unmarshalAndMountRowChanged(ctx context.Context, raw *model.RawKVEntry, rowKVEntryCache map[int64]*rowKVEntry) (*model.RowChangedEvent, error) {
 	if !bytes.HasPrefix(raw.Key, tablePrefix) {
 		return nil, nil
 	}
@@ -197,8 +201,18 @@ func (m *mounterImpl) unmarshalAndMountRowChanged(ctx context.Context, raw *mode
 			}
 			return nil, cerror.ErrSnapshotTableNotFound.GenWithStackByArgs(physicalTableID)
 		}
+		cachedRow, exist := rowKVEntryCache[physicalTableID]
+		if exist && cachedRow.TableInfoVersion == tableInfo.TableInfoVersion {
+			cachedRow.baseKVEntry = baseInfo
+		} else {
+			cachedRow = &rowKVEntry{
+				baseKVEntry:      baseInfo,
+				TableInfoVersion: tableInfo.TableInfoVersion,
+			}
+			rowKVEntryCache[physicalTableID] = cachedRow
+		}
 		if bytes.HasPrefix(key, recordPrefix) {
-			rowKV, err := m.unmarshalRowKVEntry(tableInfo, raw.Key, raw.Value, raw.OldValue, baseInfo)
+			rowKV, err := m.unmarshalRowKVEntry(tableInfo, raw.Key, raw.Value, raw.OldValue, cachedRow)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -216,32 +230,32 @@ func (m *mounterImpl) unmarshalAndMountRowChanged(ctx context.Context, raw *mode
 	return row, err
 }
 
-func (m *mounterImpl) unmarshalRowKVEntry(tableInfo *model.TableInfo, rawKey []byte, rawValue []byte, rawOldValue []byte, base baseKVEntry) (*rowKVEntry, error) {
+func (m *mounterImpl) unmarshalRowKVEntry(tableInfo *model.TableInfo, rawKey []byte, rawValue []byte, rawOldValue []byte, cachedRow *rowKVEntry) (*rowKVEntry, error) {
 	recordID, err := tablecodec.DecodeRowKey(rawKey)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	decodeRow := func(rawColValue []byte) (map[int64]types.Datum, bool, error) {
+	decodeRow := func(rawColValue []byte, cache map[int64]types.Datum) (map[int64]types.Datum, bool, error) {
 		if len(rawColValue) == 0 {
 			return nil, false, nil
 		}
-		row, err := decodeRow(rawColValue, recordID, tableInfo, m.tz)
+		row, err := decodeRow(rawColValue, recordID, tableInfo, m.tz, cache)
 		if err != nil {
 			return nil, false, errors.Trace(err)
 		}
 		return row, true, nil
 	}
 
-	row, rowExist, err := decodeRow(rawValue)
+	row, rowExist, err := decodeRow(rawValue, cachedRow.Row)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	preRow, preRowExist, err := decodeRow(rawOldValue)
+	preRow, preRowExist, err := decodeRow(rawOldValue, cachedRow.PreRow)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
-	if base.Delete && !m.enableOldValue && (tableInfo.PKIsHandle || tableInfo.IsCommonHandle) {
+	if cachedRow.Delete && !m.enableOldValue && (tableInfo.PKIsHandle || tableInfo.IsCommonHandle) {
 		handleColIDs, fieldTps, _ := tableInfo.GetRowColInfos()
 		preRow, err = tablecodec.DecodeHandleToDatumMap(recordID, handleColIDs, fieldTps, m.tz, nil)
 		if err != nil {
@@ -250,14 +264,12 @@ func (m *mounterImpl) unmarshalRowKVEntry(tableInfo *model.TableInfo, rawKey []b
 		preRowExist = true
 	}
 
-	base.RecordID = recordID
-	return &rowKVEntry{
-		baseKVEntry: base,
-		Row:         row,
-		PreRow:      preRow,
-		RowExist:    rowExist,
-		PreRowExist: preRowExist,
-	}, nil
+	cachedRow.RecordID = recordID
+	cachedRow.Row = row
+	cachedRow.PreRow = preRow
+	cachedRow.RowExist = rowExist
+	cachedRow.PreRowExist = preRowExist
+	return cachedRow, nil
 }
 
 const (
