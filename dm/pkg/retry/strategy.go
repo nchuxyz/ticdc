@@ -16,7 +16,10 @@ package retry
 import (
 	"time"
 
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+
+	"go.uber.org/zap"
 )
 
 // backoffStrategy represents enum of retry wait interval.
@@ -45,18 +48,29 @@ type Params struct {
 	IsRetryableFn func(int, error) bool
 }
 
+func NewParams(retryCount int, firstRetryDuration time.Duration, backoffStrategy backoffStrategy,
+	isRetryableFn func(int, error) bool,
+) *Params {
+	return &Params{
+		RetryCount:         retryCount,
+		FirstRetryDuration: firstRetryDuration,
+		BackoffStrategy:    backoffStrategy,
+		IsRetryableFn:      isRetryableFn,
+	}
+}
+
+// OperateFunc the function we can retry
+//   return: (result of operation, error of operation)
+type OperateFunc func(*tcontext.Context) (interface{}, error)
+
 // Strategy define different kind of retry strategy.
 type Strategy interface {
-
 	// Apply define retry strategy
 	// params: (retry parameters for this strategy, a normal operation)
 	// return: (result of operation, number of retry, error of operation)
 	Apply(ctx *tcontext.Context,
 		params Params,
-		// operateFn:
-		//   params: (context)
-		//   return: (result of operation, error of operation)
-		operateFn func(*tcontext.Context) (interface{}, error),
+		operateFn OperateFunc,
 	) (interface{}, int, error)
 }
 
@@ -64,8 +78,8 @@ type Strategy interface {
 type FiniteRetryStrategy struct{}
 
 // Apply for FiniteRetryStrategy, it wait `FirstRetryDuration` before it starts first retry, and then rest of retries wait time depends on BackoffStrategy.
-func (*FiniteRetryStrategy) Apply(ctx *tcontext.Context, params Params,
-	operateFn func(*tcontext.Context) (interface{}, error)) (ret interface{}, i int, err error) {
+func (*FiniteRetryStrategy) Apply(ctx *tcontext.Context, params Params, operateFn OperateFunc,
+) (ret interface{}, i int, err error) {
 	for ; i < params.RetryCount; i++ {
 		ret, err = operateFn(ctx)
 		if err != nil {
@@ -77,6 +91,7 @@ func (*FiniteRetryStrategy) Apply(ctx *tcontext.Context, params Params,
 					duration = time.Duration(i+1) * params.FirstRetryDuration
 				default:
 				}
+				log.L().Warn("retry stratey takes effect", zap.Error(err), zap.Int("retry_times", i), zap.Int("retry_count", params.RetryCount))
 
 				select {
 				case <-ctx.Context().Done():
@@ -89,4 +104,20 @@ func (*FiniteRetryStrategy) Apply(ctx *tcontext.Context, params Params,
 		break
 	}
 	return ret, i, err
+}
+
+// Retryer retries operateFn until success or reaches retry limit
+// todo: merge with Strategy when refactor
+type Retryer interface {
+	Apply(ctx *tcontext.Context, operateFn OperateFunc) (interface{}, int, error)
+}
+
+// FiniteRetryer wraps params.
+type FiniteRetryer struct {
+	FiniteRetryStrategy
+	Params *Params
+}
+
+func (s *FiniteRetryer) Apply(ctx *tcontext.Context, operateFn OperateFunc) (ret interface{}, i int, err error) {
+	return s.FiniteRetryStrategy.Apply(ctx, *s.Params, operateFn)
 }

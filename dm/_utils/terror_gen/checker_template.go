@@ -25,14 +25,14 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/pingcap/ticdc/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
 )
 
 const (
-	developErrorFile     = "errors_develop.txt"
-	releaseErrorFile     = "errors_release.txt"
-	generatedCheckerFile = "{{.CheckerFile}}"
-	tomlErrorFile        = "../../errors.toml"
+	developErrorFile = "errors_develop.txt"
+	releaseErrorFile = "errors_release.txt"
+	checkerFile      = "{{.CheckerFile}}"
+	tomlErrorFile    = "../../errors.toml"
 )
 
 var dumpErrorRe = regexp.MustCompile("^([a-zA-Z].*),\\[code=([0-9]+).*$")
@@ -209,7 +209,7 @@ func cleanup(success bool) {
 
 func main() {
 	defer func() {
-		os.Remove(generatedCheckerFile)
+		os.Remove(checkerFile)
 	}()
 	genErrors()
 	cleanup(compareErrors())

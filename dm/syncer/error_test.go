@@ -21,12 +21,10 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/errno"
-	"github.com/pingcap/tidb/infoschema"
-	tmysql "github.com/pingcap/tidb/parser/mysql"
 
-	"github.com/pingcap/ticdc/dm/pkg/conn"
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
-	"github.com/pingcap/ticdc/dm/syncer/dbconn"
+	"github.com/pingcap/tiflow/dm/pkg/conn"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/syncer/dbconn"
 )
 
 func newMysqlErr(number uint16, message string) *mysql.MySQLError {
@@ -36,29 +34,11 @@ func newMysqlErr(number uint16, message string) *mysql.MySQLError {
 	}
 }
 
-func (s *testSyncerSuite) TestIgnoreDDLError(c *C) {
-	cases := []struct {
-		err error
-		ret bool
-	}{
-		{errors.New("raw error"), false},
-		{newMysqlErr(tmysql.ErrDupKeyName, "Error: Duplicate key name 'some_key'"), true},
-		{newMysqlErr(uint16(infoschema.ErrDatabaseExists.Code()), "Can't create database"), true},
-		{newMysqlErr(uint16(infoschema.ErrAccessDenied.Code()), "Access denied for user"), false},
-	}
-
-	for _, t := range cases {
-		c.Assert(ignoreDDLError(t.err), Equals, t.ret)
-	}
-}
-
 func (s *testSyncerSuite) TestHandleSpecialDDLError(c *C) {
 	var (
-		syncer = NewSyncer(s.cfg, nil, nil)
-		tctx   = tcontext.Background()
-		conn2  = &dbconn.DBConn{Cfg: s.cfg, ResetBaseConnFn: func(*tcontext.Context, *conn.BaseConn) (*conn.BaseConn, error) {
-			return nil, nil
-		}}
+		syncer              = NewSyncer(s.cfg, nil, nil)
+		tctx                = tcontext.Background()
+		conn2               = dbconn.NewDBConn(s.cfg, nil)
 		customErr           = errors.New("custom error")
 		invalidDDL          = "SQL CAN NOT BE PARSED"
 		insertDML           = "INSERT INTO tbl VALUES (1)"
@@ -158,7 +138,9 @@ func (s *testSyncerSuite) TestHandleSpecialDDLError(c *C) {
 			},
 		}
 	)
-
+	conn2.ResetBaseConnFn = func(*tcontext.Context, *conn.BaseConn) (*conn.BaseConn, error) {
+		return nil, nil
+	}
 	for _, cs := range cases {
 		err2 := syncer.handleSpecialDDLError(tctx, cs.err, cs.ddls, cs.index, conn2)
 		if cs.handled {
@@ -177,7 +159,11 @@ func (s *testSyncerSuite) TestHandleSpecialDDLError(c *C) {
 	c.Assert(err, IsNil)
 	conn1, err := db.Conn(context.Background())
 	c.Assert(err, IsNil)
-	conn2.BaseConn = conn.NewBaseConn(conn1, nil)
+	conn2.ResetBaseConnFn = func(_ *tcontext.Context, _ *conn.BaseConn) (*conn.BaseConn, error) {
+		return conn.NewBaseConn(conn1, nil), nil
+	}
+	err = conn2.ResetConn(tctx)
+	c.Assert(err, IsNil)
 
 	// dropColumnF test successful
 	mock.ExpectQuery("SELECT INDEX_NAME FROM information_schema.statistics WHERE.*").WillReturnRows(

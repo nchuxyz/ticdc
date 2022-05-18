@@ -14,7 +14,7 @@
 package openapi
 
 import (
-	"github.com/pingcap/ticdc/dm/pkg/terror"
+	"encoding/json"
 )
 
 var defaultMetaSchema = "dm_meta"
@@ -24,9 +24,15 @@ func (t *Task) Adjust() error {
 	if t.MetaSchema == nil {
 		t.MetaSchema = &defaultMetaSchema
 	}
-	// check some not implemented features
-	if t.OnDuplicate != TaskOnDuplicateError {
-		return terror.ErrOpenAPICommonError.Generate("`on_duplicate` only supports `error` for now.")
-	}
 	return nil
+}
+
+// FromJSON unmarshal json to task.
+func (t *Task) FromJSON(data []byte) error {
+	return json.Unmarshal(data, t)
+}
+
+// ToJSON marshal json to task.
+func (t *Task) ToJSON() ([]byte, error) {
+	return json.Marshal(t)
 }

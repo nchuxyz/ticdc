@@ -21,10 +21,10 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/phayes/freeport"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/cdc/redo"
-	"github.com/pingcap/ticdc/cdc/redo/reader"
-	"github.com/pingcap/ticdc/cdc/sink"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/redo"
+	"github.com/pingcap/tiflow/cdc/redo/reader"
+	"github.com/pingcap/tiflow/cdc/sink/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -127,12 +127,27 @@ func TestApplyDMLs(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
+			mock.ExpectQuery("SELECT @@SESSION.sql_mode;").
+				WillReturnRows(sqlmock.NewRows([]string{"@@SESSION.sql_mode"}).
+					AddRow("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE"))
 			columns := []string{"Variable_name", "Value"}
 			mock.ExpectQuery("show session variables like 'allow_auto_random_explicit_insert';").WillReturnRows(
 				sqlmock.NewRows(columns).AddRow("allow_auto_random_explicit_insert", "0"),
 			)
 			mock.ExpectQuery("show session variables like 'tidb_txn_mode';").WillReturnRows(
 				sqlmock.NewRows(columns).AddRow("tidb_txn_mode", "pessimistic"),
+			)
+			mock.ExpectQuery("show session variables like 'transaction_isolation';").WillReturnRows(
+				sqlmock.NewRows(columns).AddRow("transaction_isolation", "REPEATED-READ"),
+			)
+			mock.ExpectQuery("show session variables like 'tidb_placement_mode';").
+				WillReturnRows(
+					sqlmock.NewRows(columns).
+						AddRow("tidb_placement_mode", "IGNORE"),
+				)
+			mock.ExpectQuery("select character_set_name from information_schema.character_sets " +
+				"where character_set_name = 'gbk';").WillReturnRows(
+				sqlmock.NewRows([]string{"character_set_name"}).AddRow("gbk"),
 			)
 			mock.ExpectClose()
 			return db, nil
@@ -158,13 +173,13 @@ func TestApplyDMLs(t *testing.T) {
 		return db, nil
 	}
 
-	getDBConnBak := sink.GetDBConnImpl
-	sink.GetDBConnImpl = mockGetDBConn
+	getDBConnBak := mysql.GetDBConnImpl
+	mysql.GetDBConnImpl = mockGetDBConn
 	createRedoReaderBak := createRedoReader
 	createRedoReader = createMockReader
 	defer func() {
 		createRedoReader = createRedoReaderBak
-		sink.GetDBConnImpl = getDBConnBak
+		mysql.GetDBConnImpl = getDBConnBak
 	}()
 
 	dmls := []*model.RowChangedEvent{
@@ -218,7 +233,9 @@ func TestApplyDMLs(t *testing.T) {
 	close(redoLogCh)
 	close(ddlEventCh)
 
-	cfg := &RedoApplierConfig{SinkURI: "mysql://127.0.0.1:4000/?worker-count=1&max-txn-row=1"}
+	cfg := &RedoApplierConfig{
+		SinkURI: "mysql://127.0.0.1:4000/?worker-count=1&max-txn-row=1&tidb_placement_mode=ignore",
+	}
 	ap := NewRedoApplier(cfg)
 	err := ap.Apply(ctx)
 	require.Nil(t, err)
@@ -231,10 +248,10 @@ func TestApplyMeetSinkError(t *testing.T) {
 	port, err := freeport.GetFreePort()
 	require.Nil(t, err)
 	cfg := &RedoApplierConfig{
-		Storage: "blackhole",
+		Storage: "blackhole://",
 		SinkURI: fmt.Sprintf("mysql://127.0.0.1:%d/?read-timeout=1s&timeout=1s", port),
 	}
 	ap := NewRedoApplier(cfg)
 	err = ap.Apply(ctx)
-	require.Regexp(t, "fail to open MySQL connection:.*connect: connection refused.*", err)
+	require.Regexp(t, "CDC:ErrMySQLConnectionError", err)
 }

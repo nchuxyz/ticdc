@@ -18,10 +18,10 @@ import (
 	"strings"
 	"testing"
 
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
-	"github.com/pingcap/ticdc/dm/pkg/metricsproxy"
-	"github.com/pingcap/ticdc/dm/pkg/retry"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/metricsproxy"
+	"github.com/pingcap/tiflow/dm/pkg/retry"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	. "github.com/pingcap/check"
@@ -52,7 +52,7 @@ func (t *testBaseConnSuite) TestBaseConn(c *C) {
 	err := baseConn.SetRetryStrategy(nil)
 	c.Assert(err, IsNil)
 
-	// nolint:sqlclosecheck
+	// nolint:sqlclosecheck,rowserrcheck
 	_, err = baseConn.QuerySQL(tctx, "select 1")
 	c.Assert(terror.ErrDBUnExpect.Equal(err), IsTrue)
 
@@ -70,7 +70,7 @@ func (t *testBaseConnSuite) TestBaseConn(c *C) {
 	c.Assert(err, IsNil)
 
 	mock.ExpectQuery("select 1").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
-	// nolint:sqlclosecheck
+	// nolint:sqlclosecheck,rowserrcheck
 	rows, err := baseConn.QuerySQL(tctx, "select 1")
 	c.Assert(err, IsNil)
 	ids := make([]int, 0, 1)
@@ -84,7 +84,7 @@ func (t *testBaseConnSuite) TestBaseConn(c *C) {
 	c.Assert(ids[0], Equals, 1)
 
 	mock.ExpectQuery("select 1").WillReturnError(errors.New("invalid connection"))
-	// nolint:sqlclosecheck
+	// nolint:sqlclosecheck,rowserrcheck
 	_, err = baseConn.QuerySQL(tctx, "select 1")
 	c.Assert(terror.ErrDBQueryFailed.Equal(err), IsTrue)
 

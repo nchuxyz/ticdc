@@ -21,19 +21,19 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"github.com/pingcap/tidb-tools/pkg/filter"
+	"github.com/pingcap/tidb/util/dbutil"
+	"github.com/pingcap/tidb/util/filter"
 
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/dm/pb"
-	"github.com/pingcap/ticdc/dm/pkg/binlog"
-	"github.com/pingcap/ticdc/dm/pkg/conn"
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
-	"github.com/pingcap/ticdc/dm/pkg/cputil"
-	"github.com/pingcap/ticdc/dm/pkg/retry"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
-	"github.com/pingcap/ticdc/dm/syncer/dbconn"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/dm/pb"
+	"github.com/pingcap/tiflow/dm/pkg/binlog"
+	"github.com/pingcap/tiflow/dm/pkg/conn"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/cputil"
+	"github.com/pingcap/tiflow/dm/pkg/retry"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/syncer/dbconn"
 )
 
 var _ = Suite(&testShardingGroupSuite{})
@@ -190,7 +190,7 @@ func (t *testShardingGroupSuite) TestSync(c *C) {
 
 	// active DDL is at pos21
 	beforeActiveDDL = g1.CheckSyncing(source2, pos21)
-	c.Assert(beforeActiveDDL, IsFalse)
+	c.Assert(beforeActiveDDL, IsTrue)
 
 	info = g1.UnresolvedGroupInfo()
 	sort.Strings(info.Synced)
@@ -241,9 +241,8 @@ func (t *testShardingGroupSuite) TestKeeper(c *C) {
 	c.Assert(err, IsNil)
 	dbConn, err := db.Conn(context.Background())
 	c.Assert(err, IsNil)
-	k.db = conn.NewBaseDB(db, func() {})
-	k.dbConn = &dbconn.DBConn{Cfg: t.cfg, BaseConn: conn.NewBaseConn(dbConn, &retry.FiniteRetryStrategy{})}
-
+	k.db = conn.NewBaseDB(db)
+	k.dbConn = dbconn.NewDBConn(t.cfg, conn.NewBaseConn(dbConn, &retry.FiniteRetryStrategy{}))
 	mock.ExpectBegin()
 	mock.ExpectExec(fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS `%s`", t.cfg.MetaSchema)).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
@@ -313,7 +312,7 @@ func (t *testShardingGroupSuite) TestKeeper(c *C) {
 	c.Assert(k.InSyncing(sourceTbl1, targetTbl, endPos11), IsFalse)
 	// position at/after active DDL, in syncing
 	c.Assert(binlog.CompareLocation(pos12, loc, false), Equals, 0)
-	c.Assert(k.InSyncing(sourceTbl1, targetTbl, pos12), IsTrue)
+	c.Assert(k.InSyncing(sourceTbl1, targetTbl, pos12), IsFalse)
 	c.Assert(binlog.CompareLocation(endPos12, loc, false), Equals, 1)
 	c.Assert(k.InSyncing(sourceTbl1, targetTbl, endPos12), IsTrue)
 

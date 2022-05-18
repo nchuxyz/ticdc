@@ -17,7 +17,7 @@ import (
 	capturer "github.com/kami-zh/go-capturer"
 	. "github.com/pingcap/check"
 
-	"github.com/pingcap/ticdc/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/log"
 )
 
 var _ = Suite(&testPrinterSuite{})
@@ -29,8 +29,7 @@ func (t *testPrinterSuite) SetUpTest(c *C) {
 }
 
 func (t *testPrinterSuite) TestPrinter(c *C) {
-	noneInfo :=
-		`Release Version: None
+	noneInfo := `Release Version: None
 Git Commit Hash: None
 Git Branch: None
 UTC Build Time: None

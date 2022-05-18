@@ -18,14 +18,14 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/pingcap/tidb-tools/pkg/schemacmp"
 	"github.com/pingcap/tidb/parser/model"
-	"go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/mvcc/mvccpb"
+	"github.com/pingcap/tidb/util/schemacmp"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/pingcap/ticdc/dm/dm/common"
-	"github.com/pingcap/ticdc/dm/pkg/etcdutil"
-	"github.com/pingcap/ticdc/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/dm/common"
+	"github.com/pingcap/tiflow/dm/pkg/etcdutil"
+	"github.com/pingcap/tiflow/dm/pkg/log"
 )
 
 // TODO: much of the code in optimistic mode is very similar to pessimistic mode, we can try to combine them together.
@@ -83,7 +83,8 @@ type LogInfo struct {
 
 // NewInfo creates a new Info instance.
 func NewInfo(task, source, upSchema, upTable, downSchema, downTable string,
-	ddls []string, tableInfoBefore *model.TableInfo, tableInfosAfter []*model.TableInfo) Info {
+	ddls []string, tableInfoBefore *model.TableInfo, tableInfosAfter []*model.TableInfo,
+) Info {
 	return Info{
 		Task:            task,
 		Source:          source,
@@ -179,7 +180,7 @@ func PutInfo(cli *clientv3.Client, info Info) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, rev, err := etcdutil.DoOpsInOneTxnWithRetry(cli, op)
+	_, rev, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(op))
 	return rev, err
 }
 
@@ -188,7 +189,7 @@ func PutInfo(cli *clientv3.Client, info Info) (int64, error) {
 // k/k/k/k/v: task-name -> source-ID -> upstream-schema-name -> upstream-table-name -> shard DDL info.
 // ugly code, but have no better idea now.
 func GetAllInfo(cli *clientv3.Client) (map[string]map[string]map[string]map[string]Info, int64, error) {
-	respTxn, _, err := etcdutil.DoOpsInOneTxnWithRetry(cli, clientv3.OpGet(common.ShardDDLOptimismInfoKeyAdapter.Path(), clientv3.WithPrefix()))
+	respTxn, _, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(clientv3.OpGet(common.ShardDDLOptimismInfoKeyAdapter.Path(), clientv3.WithPrefix())))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -221,7 +222,8 @@ func GetAllInfo(cli *clientv3.Client) (map[string]map[string]map[string]map[stri
 // WatchInfo watches PUT & DELETE operations for info.
 // This function should often be called by DM-master.
 func WatchInfo(ctx context.Context, cli *clientv3.Client, revision int64,
-	outCh chan<- Info, errCh chan<- error) {
+	outCh chan<- Info, errCh chan<- error,
+) {
 	wCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	// NOTE: WithPrevKV used to get a valid `ev.PrevKv` for deletion.
@@ -298,15 +300,14 @@ func deleteInfoOp(info Info) clientv3.Op {
 		info.Task, info.Source, info.UpSchema, info.UpTable))
 }
 
-// ClearTestInfoOperationSchema is used to clear all shard DDL information in optimism mode.
+// ClearTestInfoOperationColumns is used to clear all shard DDL information in optimism mode.
 // it only used for testing now.
-func ClearTestInfoOperationSchema(cli *clientv3.Client) error {
+func ClearTestInfoOperationColumn(cli *clientv3.Client) error {
 	clearSource := clientv3.OpDelete(common.ShardDDLOptimismSourceTablesKeyAdapter.Path(), clientv3.WithPrefix())
 	clearInfo := clientv3.OpDelete(common.ShardDDLOptimismInfoKeyAdapter.Path(), clientv3.WithPrefix())
 	clearOp := clientv3.OpDelete(common.ShardDDLOptimismOperationKeyAdapter.Path(), clientv3.WithPrefix())
-	clearISOp := clientv3.OpDelete(common.ShardDDLOptimismInitSchemaKeyAdapter.Path(), clientv3.WithPrefix())
 	clearColumns := clientv3.OpDelete(common.ShardDDLOptimismDroppedColumnsKeyAdapter.Path(), clientv3.WithPrefix())
-	_, err := cli.Txn(context.Background()).Then(clearSource, clearInfo, clearOp, clearISOp, clearColumns).Commit()
+	_, err := cli.Txn(context.Background()).Then(clearSource, clearInfo, clearOp, clearColumns).Commit()
 	return err
 }
 
@@ -378,7 +379,7 @@ func CheckDDLInfos(cli *clientv3.Client, source string, schemaMap map[string]str
 					if err != nil {
 						return err
 					}
-					_, _, err = etcdutil.DoOpsInOneTxnWithRetry(cli, delOp, putOp)
+					_, _, err = etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(delOp, putOp))
 					if err != nil {
 						return err
 					}

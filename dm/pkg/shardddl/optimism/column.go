@@ -16,10 +16,10 @@ package optimism
 import (
 	"encoding/json"
 
-	"go.etcd.io/etcd/clientv3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/pingcap/ticdc/dm/dm/common"
-	"github.com/pingcap/ticdc/dm/pkg/etcdutil"
+	"github.com/pingcap/tiflow/dm/dm/common"
+	"github.com/pingcap/tiflow/dm/pkg/etcdutil"
 )
 
 // GetAllDroppedColumns gets the all partially dropped columns.
@@ -28,7 +28,7 @@ func GetAllDroppedColumns(cli *clientv3.Client) (map[string]map[string]map[strin
 	var done DropColumnStage
 	colm := make(map[string]map[string]map[string]map[string]map[string]DropColumnStage)
 	op := clientv3.OpGet(common.ShardDDLOptimismDroppedColumnsKeyAdapter.Path(), clientv3.WithPrefix())
-	respTxn, rev, err := etcdutil.DoOpsInOneTxnWithRetry(cli, op)
+	respTxn, rev, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(op))
 	if err != nil {
 		return colm, 0, err
 	}
@@ -67,17 +67,21 @@ func GetAllDroppedColumns(cli *clientv3.Client) (map[string]map[string]map[strin
 	return colm, rev, nil
 }
 
-// PutDroppedColumn puts the partially dropped column name into ectd.
+// PutDroppedColumn puts the partially dropped column names into ectd.
 // When we drop a column, we save this column's name in etcd.
-func PutDroppedColumn(cli *clientv3.Client, lockID, column, source, upSchema, upTable string, done DropColumnStage) (rev int64, putted bool, err error) {
-	key := common.ShardDDLOptimismDroppedColumnsKeyAdapter.Encode(lockID, column, source, upSchema, upTable)
-	val, err := json.Marshal(done)
-	if err != nil {
-		return 0, false, err
+func PutDroppedColumns(cli *clientv3.Client, lockID, source, upSchema, upTable string, cols []string, done DropColumnStage) (int64, bool, error) {
+	ops := make([]clientv3.Op, 0, len(cols))
+	for _, column := range cols {
+		key := common.ShardDDLOptimismDroppedColumnsKeyAdapter.Encode(lockID, column, source, upSchema, upTable)
+		val, err := json.Marshal(done)
+		if err != nil {
+			return 0, false, err
+		}
+		op := clientv3.OpPut(key, string(val))
+		ops = append(ops, op)
 	}
-	op := clientv3.OpPut(key, string(val))
 
-	resp, rev, err := etcdutil.DoOpsInOneTxnWithRetry(cli, op)
+	resp, rev, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(ops...))
 	if err != nil {
 		return 0, false, err
 	}
@@ -93,7 +97,7 @@ func DeleteDroppedColumns(cli *clientv3.Client, lockID string, columns ...string
 	for _, col := range columns {
 		ops = append(ops, deleteDroppedColumnByColumnOp(lockID, col))
 	}
-	resp, rev, err := etcdutil.DoOpsInOneTxnWithRetry(cli, ops...)
+	resp, rev, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(ops...))
 	if err != nil {
 		return 0, false, err
 	}
@@ -149,7 +153,7 @@ func CheckColumns(cli *clientv3.Client, source string, schemaMap map[string]stri
 						opPut := clientv3.OpPut(key, string(val))
 						opDel := deleteSourceDroppedColumnsOp(lockID, columnName, source, schema, table)
 
-						_, _, err = etcdutil.DoOpsInOneTxnWithRetry(cli, opPut, opDel)
+						_, _, err = etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(opPut, opDel))
 						if err != nil {
 							return err
 						}

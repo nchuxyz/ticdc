@@ -20,13 +20,15 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/kv"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/cdc/puller/frontier"
-	"github.com/pingcap/ticdc/pkg/regionspan"
-	"github.com/pingcap/ticdc/pkg/txnutil"
-	"github.com/pingcap/ticdc/pkg/util"
 	tidbkv "github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tiflow/cdc/contextutil"
+	"github.com/pingcap/tiflow/cdc/kv"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/puller/frontier"
+	"github.com/pingcap/tiflow/pkg/config"
+	"github.com/pingcap/tiflow/pkg/pdutil"
+	"github.com/pingcap/tiflow/pkg/regionspan"
+	"github.com/pingcap/tiflow/pkg/txnutil"
 	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
 	pd "github.com/tikv/pd/client"
@@ -34,7 +36,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// DDLPullerTableName is the fake table name for ddl puller
+// DDLPullerTableName is the fake table name for ddl puller.
 const DDLPullerTableName = "DDL_PULLER"
 
 const (
@@ -42,9 +44,9 @@ const (
 	defaultPullerOutputChanSize = 128
 )
 
-// Puller pull data from tikv and push changes into a buffer
+// Puller pull data from tikv and push changes into a buffer.
 type Puller interface {
-	// Run the puller, continually fetch event from TiKV and add event into buffer
+	// Run the puller, continually fetch event from TiKV and add event into buffer.
 	Run(ctx context.Context) error
 	GetResolvedTs() uint64
 	Output() <-chan *model.RawKVEntry
@@ -52,16 +54,14 @@ type Puller interface {
 }
 
 type pullerImpl struct {
-	pdCli          pd.Client
-	kvCli          kv.CDCKVClient
-	kvStorage      tikv.Storage
-	checkpointTs   uint64
-	spans          []regionspan.ComparableSpan
-	outputCh       chan *model.RawKVEntry
-	tsTracker      frontier.Frontier
-	resolvedTs     uint64
-	initialized    int64
-	enableOldValue bool
+	kvCli        kv.CDCKVClient
+	kvStorage    tikv.Storage
+	checkpointTs uint64
+	spans        []regionspan.ComparableSpan
+	outputCh     chan *model.RawKVEntry
+	tsTracker    frontier.Frontier
+	resolvedTs   uint64
+	initialized  int64
 }
 
 // NewPuller create a new Puller fetch event start from checkpointTs
@@ -70,10 +70,13 @@ func NewPuller(
 	ctx context.Context,
 	pdCli pd.Client,
 	grpcPool kv.GrpcPool,
+	regionCache *tikv.RegionCache,
 	kvStorage tidbkv.Storage,
+	pdClock pdutil.Clock,
+	changefeed model.ChangeFeedID,
 	checkpointTs uint64,
 	spans []regionspan.Span,
-	enableOldValue bool,
+	cfg *config.KVClientConfig,
 ) Puller {
 	tikvStorage, ok := kvStorage.(tikv.Storage)
 	if !ok {
@@ -87,85 +90,75 @@ func NewPuller(
 	// the initial ts for frontier to 0. Once the puller level resolved ts
 	// initialized, the ts should advance to a non-zero value.
 	tsTracker := frontier.NewFrontier(0, comparableSpans...)
-	kvCli := kv.NewCDCKVClient(ctx, pdCli, tikvStorage, grpcPool)
+	kvCli := kv.NewCDCKVClient(
+		ctx, pdCli, tikvStorage, grpcPool, regionCache, pdClock, changefeed, cfg)
 	p := &pullerImpl{
-		pdCli:          pdCli,
-		kvCli:          kvCli,
-		kvStorage:      tikvStorage,
-		checkpointTs:   checkpointTs,
-		spans:          comparableSpans,
-		outputCh:       make(chan *model.RawKVEntry, defaultPullerOutputChanSize),
-		tsTracker:      tsTracker,
-		resolvedTs:     checkpointTs,
-		initialized:    0,
-		enableOldValue: enableOldValue,
+		kvCli:        kvCli,
+		kvStorage:    tikvStorage,
+		checkpointTs: checkpointTs,
+		spans:        comparableSpans,
+		outputCh:     make(chan *model.RawKVEntry, defaultPullerOutputChanSize),
+		tsTracker:    tsTracker,
+		resolvedTs:   checkpointTs,
+		initialized:  0,
 	}
 	return p
 }
 
-func (p *pullerImpl) Output() <-chan *model.RawKVEntry {
-	return p.outputCh
-}
-
 // Run the puller, continually fetch event from TiKV and add event into buffer
 func (p *pullerImpl) Run(ctx context.Context) error {
-	defer p.kvCli.Close()
-
 	g, ctx := errgroup.WithContext(ctx)
 
 	checkpointTs := p.checkpointTs
 	eventCh := make(chan model.RegionFeedEvent, defaultPullerEventChanSize)
 
-	lockresolver := txnutil.NewLockerResolver(p.kvStorage)
+	lockResolver := txnutil.NewLockerResolver(p.kvStorage,
+		contextutil.ChangefeedIDFromCtx(ctx), contextutil.RoleFromCtx(ctx))
 	for _, span := range p.spans {
 		span := span
 
 		g.Go(func() error {
-			return p.kvCli.EventFeed(ctx, span, checkpointTs, p.enableOldValue, lockresolver, p, eventCh)
+			return p.kvCli.EventFeed(ctx, span, checkpointTs, lockResolver, p, eventCh)
 		})
 	}
 
-	captureAddr := util.CaptureAddrFromCtx(ctx)
-	changefeedID := util.ChangefeedIDFromCtx(ctx)
-	tableID, _ := util.TableIDFromCtx(ctx)
-	metricOutputChanSize := outputChanSizeHistogram.WithLabelValues(captureAddr, changefeedID)
-	metricEventChanSize := eventChanSizeHistogram.WithLabelValues(captureAddr, changefeedID)
-	metricPullerResolvedTs := pullerResolvedTsGauge.WithLabelValues(captureAddr, changefeedID)
-	metricTxnCollectCounterKv := txnCollectCounter.WithLabelValues(captureAddr, changefeedID, "kv")
-	metricTxnCollectCounterResolved := txnCollectCounter.WithLabelValues(captureAddr, changefeedID, "resolved")
+	changefeedID := contextutil.ChangefeedIDFromCtx(ctx)
+	tableID, _ := contextutil.TableIDFromCtx(ctx)
+	metricOutputChanSize := outputChanSizeHistogram.
+		WithLabelValues(changefeedID.Namespace, changefeedID.ID)
+	metricEventChanSize := eventChanSizeHistogram.
+		WithLabelValues(changefeedID.Namespace, changefeedID.ID)
+	metricPullerResolvedTs := pullerResolvedTsGauge.
+		WithLabelValues(changefeedID.Namespace, changefeedID.ID)
+	metricTxnCollectCounterKv := txnCollectCounter.
+		WithLabelValues(changefeedID.Namespace, changefeedID.ID, "kv")
+	metricTxnCollectCounterResolved := txnCollectCounter.
+		WithLabelValues(changefeedID.Namespace, changefeedID.ID, "resolved")
 	defer func() {
-		outputChanSizeHistogram.DeleteLabelValues(captureAddr, changefeedID)
-		eventChanSizeHistogram.DeleteLabelValues(captureAddr, changefeedID)
-		memBufferSizeGauge.DeleteLabelValues(captureAddr, changefeedID)
-		pullerResolvedTsGauge.DeleteLabelValues(captureAddr, changefeedID)
-		kvEventCounter.DeleteLabelValues(captureAddr, changefeedID, "kv")
-		kvEventCounter.DeleteLabelValues(captureAddr, changefeedID, "resolved")
-		txnCollectCounter.DeleteLabelValues(captureAddr, changefeedID, "kv")
-		txnCollectCounter.DeleteLabelValues(captureAddr, changefeedID, "resolved")
+		outputChanSizeHistogram.DeleteLabelValues(changefeedID.Namespace, changefeedID.ID)
+		eventChanSizeHistogram.DeleteLabelValues(changefeedID.Namespace, changefeedID.ID)
+		memBufferSizeGauge.DeleteLabelValues(changefeedID.Namespace, changefeedID.ID)
+		pullerResolvedTsGauge.DeleteLabelValues(changefeedID.Namespace, changefeedID.ID)
+		kvEventCounter.DeleteLabelValues(changefeedID.Namespace, changefeedID.ID, "kv")
+		kvEventCounter.DeleteLabelValues(changefeedID.Namespace, changefeedID.ID, "resolved")
+		txnCollectCounter.DeleteLabelValues(changefeedID.Namespace, changefeedID.ID, "kv")
+		txnCollectCounter.DeleteLabelValues(changefeedID.Namespace, changefeedID.ID, "resolved")
 	}()
-	g.Go(func() error {
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(15 * time.Second):
-				metricEventChanSize.Observe(float64(len(eventCh)))
-				metricOutputChanSize.Observe(float64(len(p.outputCh)))
-				metricPullerResolvedTs.Set(float64(oracle.ExtractPhysical(atomic.LoadUint64(&p.resolvedTs))))
-			}
-		}
-	})
 
 	lastResolvedTs := p.checkpointTs
 	g.Go(func() error {
+		metricsTicker := time.NewTicker(15 * time.Second)
+		defer metricsTicker.Stop()
 		output := func(raw *model.RawKVEntry) error {
-			// even after https://github.com/pingcap/ticdc/pull/2038, kv client
+			// even after https://github.com/pingcap/tiflow/pull/2038, kv client
 			// could still miss region change notification, which leads to resolved
 			// ts update missing in puller, however resolved ts fallback here can
 			// be ignored since no late data is received and the guarantee of
 			// resolved ts is not broken.
 			if raw.CRTs < p.resolvedTs || (raw.CRTs == p.resolvedTs && raw.OpType != model.OpTypeResolved) {
 				log.Warn("The CRTs is fallen back in puller",
+					zap.String("namespace", changefeedID.Namespace),
+					zap.String("changefeed", changefeedID.ID),
 					zap.Reflect("row", raw),
 					zap.Uint64("CRTs", raw.CRTs),
 					zap.Uint64("resolvedTs", p.resolvedTs),
@@ -185,19 +178,30 @@ func (p *pullerImpl) Run(ctx context.Context) error {
 		for {
 			var e model.RegionFeedEvent
 			select {
-			case e = <-eventCh:
 			case <-ctx.Done():
 				return errors.Trace(ctx.Err())
+			case <-metricsTicker.C:
+				metricEventChanSize.Observe(float64(len(eventCh)))
+				metricOutputChanSize.Observe(float64(len(p.outputCh)))
+				metricPullerResolvedTs.Set(float64(oracle.ExtractPhysical(atomic.LoadUint64(&p.resolvedTs))))
+				continue
+			case e = <-eventCh:
 			}
+
 			if e.Val != nil {
 				metricTxnCollectCounterKv.Inc()
 				if err := output(e.Val); err != nil {
 					return errors.Trace(err)
 				}
-			} else if e.Resolved != nil {
+				continue
+			}
+
+			if e.Resolved != nil {
 				metricTxnCollectCounterResolved.Inc()
 				if !regionspan.IsSubSpan(e.Resolved.Span, p.spans...) {
 					log.Panic("the resolved span is not in the total span",
+						zap.String("namespace", changefeedID.Namespace),
+						zap.String("changefeed", changefeedID.ID),
 						zap.Reflect("resolved", e.Resolved),
 						zap.Int64("tableID", tableID),
 						zap.Reflect("spans", p.spans),
@@ -217,8 +221,9 @@ func (p *pullerImpl) Run(ctx context.Context) error {
 						spans = append(spans, p.spans[i].String())
 					}
 					log.Info("puller is initialized",
+						zap.String("namespace", changefeedID.Namespace),
+						zap.String("changefeed", changefeedID.ID),
 						zap.Duration("duration", time.Since(start)),
-						zap.String("changefeed", changefeedID),
 						zap.Int64("tableID", tableID),
 						zap.Strings("spans", spans),
 						zap.Uint64("resolvedTs", resolvedTs))
@@ -240,6 +245,10 @@ func (p *pullerImpl) Run(ctx context.Context) error {
 
 func (p *pullerImpl) GetResolvedTs() uint64 {
 	return atomic.LoadUint64(&p.resolvedTs)
+}
+
+func (p *pullerImpl) Output() <-chan *model.RawKVEntry {
+	return p.outputCh
 }
 
 func (p *pullerImpl) IsInitialized() bool {

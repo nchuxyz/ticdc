@@ -17,8 +17,11 @@ import (
 	"encoding/json"
 
 	"github.com/pingcap/errors"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
 )
+
+// CaptureID is the type for capture ID
+type CaptureID = string
 
 // CaptureInfo store in etcd.
 type CaptureInfo struct {
@@ -42,4 +45,14 @@ func (c *CaptureInfo) Unmarshal(data []byte) error {
 	err := json.Unmarshal(data, c)
 	return errors.Annotatef(cerror.WrapError(cerror.ErrUnmarshalFailed, err),
 		"unmarshal data: %v", data)
+}
+
+// ListVersionsFromCaptureInfos returns the version list of the CaptureInfo list.
+func ListVersionsFromCaptureInfos(captureInfos []*CaptureInfo) []string {
+	var captureVersions []string
+	for _, ci := range captureInfos {
+		captureVersions = append(captureVersions, ci.Version)
+	}
+
+	return captureVersions
 }

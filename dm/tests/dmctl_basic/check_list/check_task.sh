@@ -16,7 +16,7 @@ function check_task_pass() {
 	task_conf=$1
 	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
 		"check-task $task_conf" \
-		"\"msg\": \"check pass!!!\"" 1 \
+		"\"passed\": true" 1 \
 		"\"result\": true" 1
 }
 
@@ -27,6 +27,14 @@ function check_task_not_pass() {
 		"\"result\": false" 1
 }
 
+function check_task_not_pass_with_message() {
+	task_conf=$1
+	error_message=$2
+	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
+		"check-task $task_conf" \
+		"$error_message" 1
+}
+
 function check_task_error_database_config() {
 	task_conf=$1
 	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
@@ -35,32 +43,75 @@ function check_task_error_database_config() {
 		"Please check the database connection and the database config in configuration file" 1
 }
 
+function check_task_wrong_start_time_format() {
+	task_conf=$1
+	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
+		"check-task $task_conf --start-time '20060102 150405'" \
+		"error while parse start-time" 1
+}
+
 function check_task_error_count() {
+	task_conf=$1
 	# 10 errors
 	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
-		"check-task $cur/conf/dm-task3.yaml" \
+		"check-task $task_conf" \
 		"\"result\": false" 1 \
 		"\"failed\": 2" 1 \
 		"\"state\": \"fail\"" 2
 
 	# 1 error
 	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
-		"check-task $cur/conf/dm-task3.yaml -e 1" \
+		"check-task $task_conf -e 1" \
 		"\"result\": false" 1 \
 		"\"failed\": 2" 1 \
 		"\"state\": \"fail\"" 1
 
 	# 100 errors
 	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
-		"check-task $cur/conf/dm-task3.yaml -e 100 -w 1" \
+		"check-task $task_conf -e 100 -w 1" \
 		"\"result\": false" 1 \
 		"\"failed\": 2" 1 \
 		"\"state\": \"fail\"" 2
 
 	# 0 error
 	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
-		"check-task $cur/conf/dm-task3.yaml -e 0" \
+		"check-task $task_conf -e 0" \
 		"\"result\": false" 1 \
 		"\"failed\": 2" 1 \
 		"\"state\": \"fail\"" 0
+}
+
+function check_task_only_warning() {
+	task_conf=$1
+	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
+		"check-task $task_conf" \
+		"\"state\": \"warn\"" 1
+}
+
+function check_task_empty_dump_config() {
+	sed "/threads/d" $1 >/tmp/empty-dump.yaml
+	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
+		"check-task /tmp/empty-dump.yaml" \
+		"pre-check is passed" 1
+}
+
+function check_task_empty_load_config() {
+	sed "/pool-size/d" $1 >/tmp/empty-load.yaml
+	cat /tmp/empty-load.yaml
+	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
+		"check-task /tmp/empty-load.yaml" \
+		"pre-check is passed" 1
+}
+
+function check_task_empty_sync_config() {
+	sed "/worker-count/d" $1 >/tmp/empty-sync.yaml
+	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
+		"check-task /tmp/empty-sync.yaml" \
+		"pre-check is passed" 1
+}
+
+function check_task_empty_config() {
+	check_task_empty_dump_config $1
+	check_task_empty_load_config $1
+	check_task_empty_sync_config $1
 }

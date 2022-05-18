@@ -15,13 +15,13 @@ package cli
 
 import (
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/pkg/cmd/context"
-	"github.com/pingcap/ticdc/pkg/cmd/factory"
-	"github.com/pingcap/ticdc/pkg/cmd/util"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/etcd"
-	"github.com/pingcap/ticdc/pkg/security"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/pkg/cmd/context"
+	"github.com/pingcap/tiflow/pkg/cmd/factory"
+	"github.com/pingcap/tiflow/pkg/cmd/util"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/etcd"
+	"github.com/pingcap/tiflow/pkg/security"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
@@ -82,7 +82,9 @@ func (o *queryChangefeedOptions) run(cmd *cobra.Command) error {
 	ctx := context.GetDefaultContext()
 
 	if o.simplified {
-		resp, err := sendOwnerChangefeedQuery(ctx, o.etcdClient, o.changefeedID, o.credential)
+		resp, err := sendOwnerChangefeedQuery(ctx, o.etcdClient,
+			model.DefaultChangeFeedID(o.changefeedID),
+			o.credential)
 		if err != nil {
 			return err
 		}
@@ -92,7 +94,8 @@ func (o *queryChangefeedOptions) run(cmd *cobra.Command) error {
 		return nil
 	}
 
-	info, err := o.etcdClient.GetChangeFeedInfo(ctx, o.changefeedID)
+	info, err := o.etcdClient.GetChangeFeedInfo(ctx,
+		model.DefaultChangeFeedID(o.changefeedID))
 	if err != nil && cerror.ErrChangeFeedNotExists.NotEqual(err) {
 		return err
 	}
@@ -100,7 +103,8 @@ func (o *queryChangefeedOptions) run(cmd *cobra.Command) error {
 		log.Warn("This changefeed has been deleted, the residual meta data will be completely deleted within 24 hours.", zap.String("changgefeed", o.changefeedID))
 	}
 
-	status, _, err := o.etcdClient.GetChangeFeedStatus(ctx, o.changefeedID)
+	status, _, err := o.etcdClient.GetChangeFeedStatus(ctx,
+		model.DefaultChangeFeedID(o.changefeedID))
 	if err != nil && cerror.ErrChangeFeedNotExists.NotEqual(err) {
 		return err
 	}

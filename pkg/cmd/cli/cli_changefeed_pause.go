@@ -14,11 +14,11 @@
 package cli
 
 import (
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/pkg/cmd/context"
-	"github.com/pingcap/ticdc/pkg/cmd/factory"
-	"github.com/pingcap/ticdc/pkg/etcd"
-	"github.com/pingcap/ticdc/pkg/security"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/pkg/cmd/context"
+	"github.com/pingcap/tiflow/pkg/cmd/factory"
+	"github.com/pingcap/tiflow/pkg/etcd"
+	"github.com/pingcap/tiflow/pkg/security"
 	"github.com/spf13/cobra"
 )
 
@@ -60,7 +60,7 @@ func (o *pauseChangefeedOptions) complete(f factory.Factory) error {
 // run the `cli changefeed pause` command.
 func (o *pauseChangefeedOptions) run() error {
 	job := model.AdminJob{
-		CfID: o.changefeedID,
+		CfID: model.DefaultChangeFeedID(o.changefeedID),
 		Type: model.AdminStop,
 	}
 

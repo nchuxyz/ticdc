@@ -14,10 +14,14 @@
 package gtid
 
 import (
+	"strings"
+
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/pingcap/errors"
+	"go.uber.org/zap"
 
-	"github.com/pingcap/ticdc/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
 )
 
 // Set provide gtid operations for syncer.
@@ -35,13 +39,13 @@ type Set interface {
 	Origin() mysql.GTIDSet
 	Equal(other Set) bool
 	Contain(other Set) bool
+	Update(gtidStr string) error
 
 	// Truncate truncates the current GTID sets until the `end` in-place.
 	// NOTE: the original GTID sets should contain the end GTID sets, otherwise it's invalid.
 	// like truncating `00c04543-f584-11e9-a765-0242ac120002:1-100` with `00c04543-f584-11e9-a765-0242ac120002:40-60`
 	// should become `00c04543-f584-11e9-a765-0242ac120002:1-60`.
 	Truncate(end Set) error
-
 	String() string
 }
 
@@ -80,12 +84,35 @@ func ParserGTID(flavor, gtidStr string) (Set, error) {
 	case mysql.MariaDBFlavor:
 		m = &MariadbGTIDSet{}
 	case mysql.MySQLFlavor:
+		// check for xxx:0
+		if IsNilMySQLGTIDSet(gtidStr) {
+			log.L().Warn("get empty gtid set end with `0`", zap.String("gtid", gtidStr))
+			return MinGTIDSet(mysql.MySQLFlavor), nil
+		}
 		m = &MySQLGTIDSet{}
 	default:
 		return nil, terror.ErrNotSupportedFlavor.Generate(flavor)
 	}
+
 	err = m.Set(gtid)
 	return m, err
+}
+
+// check whether a gtid set is nil(start sync from start)
+// mysql: uuid:0
+// mariadb: 0-0-0(no need to handle)
+func IsNilMySQLGTIDSet(gStr string) bool {
+	sp := strings.Split(gStr, ",")
+	if len(sp) != 1 {
+		return false
+	}
+
+	sep := strings.Split(sp[0], ":")
+	if len(sep) != 2 {
+		return false
+	}
+	interval := strings.TrimSpace(sep[1])
+	return interval == "0"
 }
 
 // MinGTIDSet returns the min GTID set.
@@ -210,20 +237,28 @@ func (g *MySQLGTIDSet) Equal(other Set) bool {
 
 // Contain implements Set.Contain.
 func (g *MySQLGTIDSet) Contain(other Set) bool {
-	otherIsNil := other == nil
-	if !otherIsNil {
-		otherGs, ok := other.(*MySQLGTIDSet)
-		if !ok {
-			return false
-		}
-		otherIsNil = otherGs == nil
-	}
-	if otherIsNil {
+	if other == nil {
 		return true // any set (including nil) contains nil
-	} else if g == nil {
+	}
+
+	otherGS, ok := other.(*MySQLGTIDSet)
+	if !ok {
+		return false
+	}
+
+	if otherGS == nil {
+		return true // any set (including nil) contains nil
+	}
+
+	if g == nil {
 		return false // nil only contains nil
 	}
+
 	return g.set.Contain(other.Origin())
+}
+
+func (g *MySQLGTIDSet) Update(gtidStr string) error {
+	return g.set.Update(gtidStr)
 }
 
 // Truncate implements Set.Truncate.
@@ -376,20 +411,28 @@ func (m *MariadbGTIDSet) Equal(other Set) bool {
 
 // Contain implements Set.Contain.
 func (m *MariadbGTIDSet) Contain(other Set) bool {
-	otherIsNil := other == nil
-	if !otherIsNil {
-		otherGS, ok := other.(*MariadbGTIDSet)
-		if !ok {
-			return false
-		}
-		otherIsNil = otherGS == nil
-	}
-	if otherIsNil {
+	if other == nil {
 		return true // any set (including nil) contains nil
-	} else if m == nil {
+	}
+
+	otherGS, ok := other.(*MariadbGTIDSet)
+	if !ok {
+		return false
+	}
+
+	if otherGS == nil {
+		return true // any set (including nil) contains nil
+	}
+
+	if m == nil {
 		return false // nil only contains nil
 	}
+
 	return m.set.Contain(other.Origin())
+}
+
+func (m *MariadbGTIDSet) Update(gtidStr string) error {
+	return m.set.Update(gtidStr)
 }
 
 // Truncate implements Set.Truncate.

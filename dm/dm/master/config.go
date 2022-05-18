@@ -26,13 +26,13 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"go.etcd.io/etcd/embed"
+	"go.etcd.io/etcd/server/v3/embed"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 const (
@@ -48,9 +48,9 @@ const (
 	quotaBackendBytesLowerBound    = 500 * 1024 * 1024      // 500MB
 )
 
-// SampleConfigFile is sample config file of dm-master.
+// SampleConfig is sample config of dm-master.
 //go:embed dm-master.toml
-var SampleConfigFile string
+var SampleConfig string
 
 // NewConfig creates a config for dm-master.
 func NewConfig() *Config {
@@ -60,6 +60,7 @@ func NewConfig() *Config {
 
 	fs.BoolVar(&cfg.printVersion, "V", false, "prints version and exit")
 	fs.BoolVar(&cfg.printSampleConfig, "print-sample-config", false, "print sample config file of dm-worker")
+	fs.BoolVar(&cfg.OpenAPI, "openapi", false, "enable openapi")
 	fs.StringVar(&cfg.ConfigFile, "config", "", "path to config file")
 	fs.StringVar(&cfg.MasterAddr, "master-addr", "", "master API server and status addr")
 	fs.StringVar(&cfg.AdvertiseAddr, "advertise-addr", "", `advertise address for client traffic (default "${master-addr}")`)
@@ -88,6 +89,10 @@ func NewConfig() *Config {
 	fs.StringVar(&cfg.V1SourcesPath, "v1-sources-path", "", "directory path used to store source config files when upgrading from v1.0.x")
 
 	return cfg
+}
+
+type ExperimentalFeatures struct {
+	OpenAPI bool `toml:"openapi,omitempty"` // OpenAPI is available in v5.4 as default.
 }
 
 // Config is the configuration for dm-master.
@@ -124,6 +129,7 @@ type Config struct {
 	AutoCompactionMode      string `toml:"auto-compaction-mode" json:"auto-compaction-mode"`
 	AutoCompactionRetention string `toml:"auto-compaction-retention" json:"auto-compaction-retention"`
 	QuotaBackendBytes       int64  `toml:"quota-backend-bytes" json:"quota-backend-bytes"`
+	OpenAPI                 bool   `toml:"openapi" json:"openapi"`
 
 	// directory path used to store source config files when upgrading from v1.0.x.
 	// if this path set, DM-master leader will try to upgrade from v1.0.x to the current version.
@@ -134,6 +140,8 @@ type Config struct {
 
 	printVersion      bool
 	printSampleConfig bool
+
+	ExperimentalFeatures ExperimentalFeatures `toml:"experimental"`
 }
 
 func (c *Config) String() string {
@@ -170,7 +178,7 @@ func (c *Config) Parse(arguments []string) error {
 	}
 
 	if c.printSampleConfig {
-		fmt.Println(SampleConfigFile)
+		fmt.Println(SampleConfig)
 		return flag.ErrHelp
 	}
 
@@ -210,6 +218,23 @@ func (c *Config) configFromFile(path string) error {
 		return terror.ErrMasterConfigUnknownItem.Generate(strings.Join(undecodedItems, ","))
 	}
 	return nil
+}
+
+// FromContent loads config from TOML format content.
+func (c *Config) FromContent(content string) error {
+	metaData, err := toml.Decode(content, c)
+	if err != nil {
+		return terror.ErrMasterConfigTomlTransform.Delegate(err)
+	}
+	undecoded := metaData.Undecoded()
+	if len(undecoded) > 0 {
+		var undecodedItems []string
+		for _, item := range undecoded {
+			undecodedItems = append(undecodedItems, item.String())
+		}
+		return terror.ErrMasterConfigUnknownItem.Generate(strings.Join(undecodedItems, ","))
+	}
+	return c.adjust()
 }
 
 // adjust adjusts configs.
@@ -307,6 +332,11 @@ func (c *Config) adjust() error {
 		c.QuotaBackendBytes = quotaBackendBytesLowerBound
 	}
 
+	if c.ExperimentalFeatures.OpenAPI {
+		c.OpenAPI = true
+		c.ExperimentalFeatures.OpenAPI = false
+		log.L().Warn("openapi is a GA feature and removed from experimental features, so this configuration may have no affect in feature release, please set openapi=true in dm-master config file")
+	}
 	return err
 }
 
@@ -431,10 +461,8 @@ func genEmbedEtcdConfigWithLogger(logLevel string) *embed.Config {
 		log.L().Info("Set log level of etcd to `warn`, if you want to log more message about etcd, change log-level to `debug` in master configuration file")
 		logger.Logger = logger.WithOptions(zap.IncreaseLevel(zap.WarnLevel))
 	}
-
 	cfg.ZapLoggerBuilder = embed.NewZapCoreLoggerBuilder(logger.Logger, logger.Core(), log.Props().Syncer) // use global app props.
 	cfg.Logger = "zap"
-
 	// TODO: we run ZapLoggerBuilder to set SetLoggerV2 before we do some etcd operations
 	//       otherwise we will meet data race while running `grpclog.SetLoggerV2`
 	//       It's vert tricky here, we should use a better way to avoid this in the future.

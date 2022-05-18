@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"testing"
 	"time"
@@ -25,11 +26,22 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/log"
-	"github.com/pingcap/tidb-tools/pkg/filter"
+	"github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/ast"
 	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/util/filter"
+	timock "github.com/pingcap/tidb/util/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/pingcap/ticdc/dm/pkg/conn"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/pkg/conn"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	dlog "github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/syncer/dbconn"
 )
 
 func Test(t *testing.T) {
@@ -41,12 +53,14 @@ var _ = Suite(&trackerSuite{})
 var defaultTestSessionCfg = map[string]string{"sql_mode": "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"}
 
 type trackerSuite struct {
-	baseConn   *conn.BaseConn
+	dbConn     *dbconn.DBConn
 	db         *sql.DB
 	backupKeys []string
+	cfg        *config.SubTaskConfig
 }
 
 func (s *trackerSuite) SetUpSuite(c *C) {
+	s.cfg = &config.SubTaskConfig{}
 	s.backupKeys = downstreamVars
 	downstreamVars = []string{"sql_mode"}
 	db, _, err := sqlmock.New()
@@ -54,7 +68,7 @@ func (s *trackerSuite) SetUpSuite(c *C) {
 	c.Assert(err, IsNil)
 	con, err := db.Conn(context.Background())
 	c.Assert(err, IsNil)
-	s.baseConn = conn.NewBaseConn(con, nil)
+	s.dbConn = dbconn.NewDBConn(s.cfg, conn.NewBaseConn(con, nil))
 }
 
 func (s *trackerSuite) TearDownSuite(c *C) {
@@ -75,38 +89,43 @@ func (s *trackerSuite) TestTiDBAndSessionCfg(c *C) {
 	con, err := db.Conn(context.Background())
 	c.Assert(err, IsNil)
 	baseConn := conn.NewBaseConn(con, nil)
-
+	dbConn := dbconn.NewDBConn(s.cfg, baseConn)
 	// user give correct session config
-	_, err = NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, baseConn)
+
+	t, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, dbConn)
+	c.Assert(err, IsNil)
+	err = t.Close()
 	c.Assert(err, IsNil)
 
 	// user give wrong session session, will return error
 	sessionCfg := map[string]string{"sql_mode": "HaHa"}
-	_, err = NewTracker(context.Background(), "test-tracker", sessionCfg, baseConn)
+	_, err = NewTracker(context.Background(), "test-tracker", sessionCfg, dbConn)
 	c.Assert(err, NotNil)
 
 	// discover session config failed, will return error
 	mock.ExpectQuery("SHOW VARIABLES LIKE 'sql_mode'").WillReturnRows(
 		sqlmock.NewRows([]string{"Variable_name", "Value"}).
 			AddRow("sql_mode", "HaHa"))
-	_, err = NewTracker(context.Background(), "test-tracker", nil, baseConn)
+	_, err = NewTracker(context.Background(), "test-tracker", nil, dbConn)
 	c.Assert(err, NotNil)
 
 	// empty or default config in downstream
 	mock.ExpectQuery("SHOW VARIABLES LIKE 'sql_mode'").WillReturnRows(
 		sqlmock.NewRows([]string{"Variable_name", "Value"}).
-			AddRow("sql_mode", ""))
-	tracker, err := NewTracker(context.Background(), "test-tracker", nil, baseConn)
+			AddRow("sql_mode", defaultTestSessionCfg["sql_mode"]))
+	tracker, err := NewTracker(context.Background(), "test-tracker", nil, dbConn)
 	c.Assert(err, IsNil)
 	c.Assert(mock.ExpectationsWereMet(), IsNil)
 	err = tracker.Exec(context.Background(), "", "create database testdb;")
+	c.Assert(err, IsNil)
+	err = tracker.Close()
 	c.Assert(err, IsNil)
 
 	// found session config in downstream
 	mock.ExpectQuery("SHOW VARIABLES LIKE 'sql_mode'").WillReturnRows(
 		sqlmock.NewRows([]string{"Variable_name", "Value"}).
 			AddRow("sql_mode", "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE"))
-	tracker, err = NewTracker(context.Background(), "test-tracker", nil, baseConn)
+	tracker, err = NewTracker(context.Background(), "test-tracker", nil, dbConn)
 	c.Assert(err, IsNil)
 	c.Assert(mock.ExpectationsWereMet(), IsNil)
 	c.Assert(tracker.se.GetSessionVars().SQLMode.HasOnlyFullGroupBy(), IsTrue)
@@ -119,11 +138,13 @@ func (s *trackerSuite) TestTiDBAndSessionCfg(c *C) {
 	// Now create the table with ZERO_DATE
 	err = tracker.Exec(ctx, "testdb", "create table foo (a varchar(255) primary key, b DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00')")
 	c.Assert(err, NotNil)
+	err = tracker.Close()
+	c.Assert(err, IsNil)
 
 	// user set session config, get tracker config from downstream
 	// no `STRICT_TRANS_TABLES`, no error now
 	sessionCfg = map[string]string{"sql_mode": "NO_ZERO_DATE,NO_ZERO_IN_DATE,ANSI_QUOTES"}
-	tracker, err = NewTracker(context.Background(), "test-tracker", sessionCfg, baseConn)
+	tracker, err = NewTracker(context.Background(), "test-tracker", sessionCfg, dbConn)
 	c.Assert(err, IsNil)
 	c.Assert(mock.ExpectationsWereMet(), IsNil)
 
@@ -155,8 +176,15 @@ func (s *trackerSuite) TestTiDBAndSessionCfg(c *C) {
 		"sql_mode":                    "NO_ZERO_DATE,NO_ZERO_IN_DATE,ANSI_QUOTES",
 		"tidb_enable_clustered_index": "ON",
 	}
-	tracker, err = NewTracker(context.Background(), "test-tracker", sessionCfg, baseConn)
+	err = tracker.Close()
 	c.Assert(err, IsNil)
+
+	tracker, err = NewTracker(context.Background(), "test-tracker", sessionCfg, dbConn)
+	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
 	c.Assert(mock.ExpectationsWereMet(), IsNil)
 
 	err = tracker.Exec(ctx, "", "create database testdb;")
@@ -175,8 +203,12 @@ func (s *trackerSuite) TestDDL(c *C) {
 		Name:   "foo",
 	}
 
-	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.dbConn)
 	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
 
 	// Table shouldn't exist before initialization.
 	_, err = tracker.GetTableInfo(table)
@@ -236,13 +268,21 @@ func (s *trackerSuite) TestDDL(c *C) {
 	cts, err = tracker.GetCreateTable(context.Background(), table)
 	c.Assert(err, IsNil)
 	c.Assert(cts, Equals, "CREATE TABLE `foo` ( `a` varchar(255) NOT NULL, `c` int(11) DEFAULT NULL, PRIMARY KEY (`a`) /*T![clustered_index] NONCLUSTERED */) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin")
+
+	// test expression index on tidb_shard.
+	err = tracker.Exec(ctx, "testdb", "CREATE TABLE bar (f_id INT PRIMARY KEY, UNIQUE KEY uniq_order_id ((tidb_shard(f_id)),f_id))")
+	c.Assert(err, IsNil)
 }
 
 func (s *trackerSuite) TestGetSingleColumnIndices(c *C) {
 	log.SetLevel(zapcore.ErrorLevel)
 
-	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.dbConn)
 	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
 
 	ctx := context.Background()
 	err = tracker.Exec(ctx, "", "create database testdb;")
@@ -280,8 +320,12 @@ func (s *trackerSuite) TestGetSingleColumnIndices(c *C) {
 func (s *trackerSuite) TestCreateSchemaIfNotExists(c *C) {
 	log.SetLevel(zapcore.ErrorLevel)
 
-	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.dbConn)
 	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
 
 	// We cannot create a table without a database.
 	ctx := context.Background()
@@ -308,8 +352,12 @@ func (s *trackerSuite) TestCreateSchemaIfNotExists(c *C) {
 func (s *trackerSuite) TestMultiDrop(c *C) {
 	log.SetLevel(zapcore.ErrorLevel)
 
-	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.dbConn)
 	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
 
 	ctx := context.Background()
 	err = tracker.CreateSchemaIfNotExists("testdb")
@@ -356,8 +404,12 @@ func (s *trackerSuite) TestCreateTableIfNotExists(c *C) {
 		Name:   "foo",
 	}
 
-	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.dbConn)
 	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
 
 	// Create some sort of complicated table.
 	err = tracker.CreateSchemaIfNotExists("testdb")
@@ -432,12 +484,132 @@ func (s *trackerSuite) TestCreateTableIfNotExists(c *C) {
 	c.Assert(duration.Seconds(), Less, float64(30))
 }
 
+func (s *trackerSuite) TestBatchCreateTableIfNotExist(c *C) {
+	log.SetLevel(zapcore.ErrorLevel)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.dbConn)
+	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
+	err = tracker.CreateSchemaIfNotExists("testdb")
+	c.Assert(err, IsNil)
+	err = tracker.CreateSchemaIfNotExists("testdb2")
+	c.Assert(err, IsNil)
+
+	tables := []*filter.Table{
+		{
+			Schema: "testdb",
+			Name:   "foo",
+		},
+		{
+			Schema: "testdb",
+			Name:   "foo1",
+		},
+		{
+			Schema: "testdb2",
+			Name:   "foo3",
+		},
+	}
+	execStmt := []string{
+		`create table foo(
+			a int primary key auto_increment,
+			b int as (c+1) not null,
+			c int comment 'some cmt',
+			d text,
+			key dk(d(255))
+		) comment 'more cmt' partition by range columns (a) (
+			partition x41 values less than (41),
+			partition x82 values less than (82),
+			partition rest values less than maxvalue comment 'part cmt'
+		);`,
+		`create table foo1(
+			a int primary key,
+			b text not null,
+			d datetime,
+			e varchar(5)
+		);`,
+		`create table foo3(
+			a int,
+			b int,
+			primary key(a));`,
+	}
+	tiInfos := make([]*model.TableInfo, len(tables))
+	for i := range tables {
+		ctx := context.Background()
+		err = tracker.Exec(ctx, tables[i].Schema, execStmt[i])
+		c.Assert(err, IsNil)
+		tiInfos[i], err = tracker.GetTableInfo(tables[i])
+		c.Assert(err, IsNil)
+		c.Assert(tiInfos[i], NotNil)
+		c.Assert(tiInfos[i].Name.O, Equals, tables[i].Name)
+		tiInfos[i] = tiInfos[i].Clone()
+		clearVolatileInfo(tiInfos[i])
+	}
+	// drop all tables and recover
+	// 1. drop
+	for i := range tables {
+		err = tracker.DropTable(tables[i])
+		c.Assert(err, IsNil)
+		_, err = tracker.GetTableInfo(tables[i])
+		c.Assert(err, ErrorMatches, `.*Table 'testdb.*\.foo.*' doesn't exist`) // drop table success
+	}
+	// 2. recover
+	tablesToCreate := map[string]map[string]*model.TableInfo{}
+	tablesToCreate["testdb"] = map[string]*model.TableInfo{}
+	tablesToCreate["testdb2"] = map[string]*model.TableInfo{}
+	for i := range tables {
+		tablesToCreate[tables[i].Schema][tables[i].Name] = tiInfos[i]
+	}
+	err = tracker.BatchCreateTableIfNotExist(tablesToCreate)
+	c.Assert(err, IsNil)
+	// 3. check all create success
+	for i := range tables {
+		var ti *model.TableInfo
+		ti, err = tracker.GetTableInfo(tables[i])
+		c.Assert(err, IsNil)
+		cloneTi := ti.Clone()
+		clearVolatileInfo(cloneTi)
+		c.Assert(cloneTi, DeepEquals, tiInfos[i])
+	}
+
+	// drop two tables and create all three
+	// expect: silently succeed
+	// 1. drop table
+	err = tracker.DropTable(tables[2])
+	c.Assert(err, IsNil)
+	err = tracker.DropTable(tables[0])
+	c.Assert(err, IsNil)
+	// 2. batch create
+	err = tracker.BatchCreateTableIfNotExist(tablesToCreate)
+	c.Assert(err, IsNil)
+	// 3. check
+	for i := range tables {
+		var ti *model.TableInfo
+		ti, err = tracker.GetTableInfo(tables[i])
+		c.Assert(err, IsNil)
+		clearVolatileInfo(ti)
+		c.Assert(ti, DeepEquals, tiInfos[i])
+	}
+
+	// BatchCreateTableIfNotExist will also create database
+	ctx := context.Background()
+	err = tracker.Exec(ctx, "", `drop database testdb`)
+	c.Assert(err, IsNil)
+	err = tracker.BatchCreateTableIfNotExist(tablesToCreate)
+	c.Assert(err, IsNil)
+}
+
 func (s *trackerSuite) TestAllSchemas(c *C) {
 	log.SetLevel(zapcore.ErrorLevel)
 	ctx := context.Background()
 
-	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, s.dbConn)
 	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
 
 	// nothing should exist...
 	c.Assert(tracker.AllSchemas(), HasLen, 0)
@@ -455,6 +627,15 @@ func (s *trackerSuite) TestAllSchemas(c *C) {
 	c.Assert(err, IsNil)
 	err = tracker.Exec(ctx, "testdb1", "create table c(a int)")
 	c.Assert(err, IsNil)
+
+	// check schema tables
+	tables, err := tracker.ListSchemaTables("testdb1")
+	c.Assert(err, IsNil)
+	c.Assert(tables, DeepEquals, []string{"b", "c"})
+	// check schema not exists
+	notExistSchemaName := "testdb_not_found"
+	_, err = tracker.ListSchemaTables(notExistSchemaName)
+	c.Assert(terror.ErrSchemaTrackerUnSchemaNotExist.Equal(err), IsTrue)
 
 	// check that all schemas and tables are present.
 	allSchemas := tracker.AllSchemas()
@@ -510,15 +691,276 @@ func (s *trackerSuite) TestNotSupportedVariable(c *C) {
 	con, err := db.Conn(context.Background())
 	c.Assert(err, IsNil)
 	baseConn := conn.NewBaseConn(con, nil)
+	dbConn := dbconn.NewDBConn(s.cfg, baseConn)
 
 	mock.ExpectQuery("SHOW VARIABLES LIKE 'sql_mode'").WillReturnRows(
 		sqlmock.NewRows([]string{"Variable_name", "Value"}).
-			AddRow("sql_mode", ""))
+			AddRow("sql_mode", defaultTestSessionCfg["sql_mode"]))
 
 	oldSessionVar := map[string]string{
 		"tidb_enable_change_column_type": "ON",
 	}
-
-	_, err = NewTracker(context.Background(), "test-tracker", oldSessionVar, baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", oldSessionVar, dbConn)
 	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
+}
+
+func (s *trackerSuite) TestInitDownStreamSQLModeAndParser(c *C) {
+	log.SetLevel(zapcore.ErrorLevel)
+
+	// tracker and sqlmock
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	defer db.Close()
+	con, err := db.Conn(context.Background())
+	c.Assert(err, IsNil)
+	baseConn := conn.NewBaseConn(con, nil)
+	dbConn := dbconn.NewDBConn(s.cfg, baseConn)
+
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, dbConn)
+	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(fmt.Sprintf("SET SESSION SQL_MODE = '%s'", mysql.DefaultSQLMode)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	tctx := tcontext.NewContext(context.Background(), dlog.L())
+
+	err = tracker.dsTracker.initDownStreamSQLModeAndParser(tctx)
+	c.Assert(err, IsNil)
+	c.Assert(tracker.dsTracker.stmtParser, NotNil)
+}
+
+func (s *trackerSuite) TestGetDownStreamIndexInfo(c *C) {
+	log.SetLevel(zapcore.ErrorLevel)
+
+	// origin table info
+	p := parser.New()
+	se := timock.NewContext()
+	node, err := p.ParseOneStmt("create table t(a int, b int, c varchar(10))", "utf8mb4", "utf8mb4_bin")
+	c.Assert(err, IsNil)
+	oriTi, err := ddl.MockTableInfo(se, node.(*ast.CreateTableStmt), 1)
+	c.Assert(err, IsNil)
+
+	// tracker and sqlmock
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	defer db.Close()
+	con, err := db.Conn(context.Background())
+	c.Assert(err, IsNil)
+	baseConn := conn.NewBaseConn(con, nil)
+	dbConn := dbconn.NewDBConn(s.cfg, baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, dbConn)
+	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(fmt.Sprintf("SET SESSION SQL_MODE = '%s'", mysql.DefaultSQLMode)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	tableID := "`test`.`test`"
+
+	mock.ExpectQuery("SHOW CREATE TABLE " + tableID).WillReturnRows(
+		sqlmock.NewRows([]string{"Table", "Create Table"}).
+			AddRow("test", "create table t(a int primary key, b int, c varchar(10))"))
+	dti, err := tracker.GetDownStreamTableInfo(tcontext.Background(), tableID, oriTi)
+	c.Assert(err, IsNil)
+	c.Assert(dti, NotNil)
+	c.Assert(dti.WhereHandle.UniqueNotNullIdx, NotNil)
+	delete(tracker.dsTracker.tableInfos, tableID)
+}
+
+func (s *trackerSuite) TestReTrackDownStreamIndex(c *C) {
+	log.SetLevel(zapcore.ErrorLevel)
+
+	// origin table info
+	p := parser.New()
+	se := timock.NewContext()
+	node, err := p.ParseOneStmt("create table t(a int, b int, c varchar(10))", "utf8mb4", "utf8mb4_bin")
+	c.Assert(err, IsNil)
+	oriTi, err := ddl.MockTableInfo(se, node.(*ast.CreateTableStmt), 1)
+	c.Assert(err, IsNil)
+
+	// tracker and sqlmock
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	defer db.Close()
+	con, err := db.Conn(context.Background())
+	c.Assert(err, IsNil)
+	baseConn := conn.NewBaseConn(con, nil)
+	dbConn := dbconn.NewDBConn(s.cfg, baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, dbConn)
+	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(fmt.Sprintf("SET SESSION SQL_MODE = '%s'", mysql.DefaultSQLMode)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	tableID := "`test`.`test`"
+
+	mock.ExpectQuery("SHOW CREATE TABLE " + tableID).WillReturnRows(
+		sqlmock.NewRows([]string{"Table", "Create Table"}).
+			AddRow("test", "create table t(a int, b int, c varchar(10), PRIMARY KEY (a,b))"))
+	_, err = tracker.GetDownStreamTableInfo(tcontext.Background(), tableID, oriTi)
+	c.Assert(err, IsNil)
+	_, ok := tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsTrue)
+
+	// just table
+	targetTables := []*filter.Table{{Schema: "test", Name: "a"}, {Schema: "test", Name: "test"}}
+	tracker.RemoveDownstreamSchema(tcontext.Background(), targetTables)
+	_, ok = tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsFalse)
+
+	mock.ExpectQuery("SHOW CREATE TABLE " + tableID).WillReturnRows(
+		sqlmock.NewRows([]string{"Table", "Create Table"}).
+			AddRow("test", "create table t(a int, b int, c varchar(10), PRIMARY KEY (a,b))"))
+	_, err = tracker.GetDownStreamTableInfo(tcontext.Background(), tableID, oriTi)
+	c.Assert(err, IsNil)
+	_, ok = tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsTrue)
+
+	tracker.RemoveDownstreamSchema(tcontext.Background(), targetTables)
+	_, ok = tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsFalse)
+
+	mock.ExpectQuery("SHOW CREATE TABLE " + tableID).WillReturnRows(
+		sqlmock.NewRows([]string{"Table", "Create Table"}).
+			AddRow("test", "create table t(a int primary key, b int, c varchar(10))"))
+	_, err = tracker.GetDownStreamTableInfo(tcontext.Background(), tableID, oriTi)
+	c.Assert(err, IsNil)
+	_, ok = tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsTrue)
+
+	// just schema
+	targetTables = []*filter.Table{{Schema: "test", Name: "a"}, {Schema: "test", Name: ""}}
+	tracker.RemoveDownstreamSchema(tcontext.Background(), targetTables)
+	_, ok = tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsFalse)
+
+	mock.ExpectQuery("SHOW CREATE TABLE " + tableID).WillReturnRows(
+		sqlmock.NewRows([]string{"Table", "Create Table"}).
+			AddRow("test", "create table t(a int, b int, c varchar(10), PRIMARY KEY (a,b))"))
+	_, err = tracker.GetDownStreamTableInfo(tcontext.Background(), tableID, oriTi)
+	c.Assert(err, IsNil)
+	_, ok = tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsTrue)
+
+	tracker.RemoveDownstreamSchema(tcontext.Background(), targetTables)
+	_, ok = tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsFalse)
+
+	mock.ExpectQuery("SHOW CREATE TABLE " + tableID).WillReturnRows(
+		sqlmock.NewRows([]string{"Table", "Create Table"}).
+			AddRow("test", "create table t(a int primary key, b int, c varchar(10))"))
+	_, err = tracker.GetDownStreamTableInfo(tcontext.Background(), tableID, oriTi)
+	c.Assert(err, IsNil)
+	_, ok = tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsTrue)
+}
+
+func (s *trackerSuite) TestVarchar20000(c *C) {
+	log.SetLevel(zapcore.ErrorLevel)
+
+	// origin table info
+	p := parser.New()
+	node, err := p.ParseOneStmt("create table t(c varchar(20000)) charset=utf8", "", "")
+	c.Assert(err, IsNil)
+	oriTi, err := ddl.BuildTableInfoFromAST(node.(*ast.CreateTableStmt))
+	c.Assert(err, IsNil)
+
+	// tracker and sqlmock
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	defer db.Close()
+	con, err := db.Conn(context.Background())
+	c.Assert(err, IsNil)
+	baseConn := conn.NewBaseConn(con, nil)
+	dbConn := dbconn.NewDBConn(s.cfg, baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, dbConn)
+	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(fmt.Sprintf("SET SESSION SQL_MODE = '%s'", mysql.DefaultSQLMode)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	tableID := "`test`.`test`"
+
+	mock.ExpectQuery("SHOW CREATE TABLE " + tableID).WillReturnRows(
+		sqlmock.NewRows([]string{"Table", "Create Table"}).
+			AddRow("test", "create table t(c varchar(20000)) charset=utf8"))
+	_, err = tracker.GetDownStreamTableInfo(tcontext.Background(), tableID, oriTi)
+	c.Assert(err, IsNil)
+	_, ok := tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsTrue)
+}
+
+func (s *trackerSuite) TestPlacementRule(c *C) {
+	log.SetLevel(zapcore.ErrorLevel)
+
+	// origin table info
+	p := parser.New()
+	node, err := p.ParseOneStmt("create table t(c int) charset=utf8mb4", "", "")
+	c.Assert(err, IsNil)
+	oriTi, err := ddl.BuildTableInfoFromAST(node.(*ast.CreateTableStmt))
+	c.Assert(err, IsNil)
+
+	// tracker and sqlmock
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	defer db.Close()
+	con, err := db.Conn(context.Background())
+	c.Assert(err, IsNil)
+	baseConn := conn.NewBaseConn(con, nil)
+	dbConn := dbconn.NewDBConn(s.cfg, baseConn)
+	tracker, err := NewTracker(context.Background(), "test-tracker", defaultTestSessionCfg, dbConn)
+	c.Assert(err, IsNil)
+	defer func() {
+		err = tracker.Close()
+		c.Assert(err, IsNil)
+	}()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(fmt.Sprintf("SET SESSION SQL_MODE = '%s'", mysql.DefaultSQLMode)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	tableID := "`test`.`test`"
+
+	mock.ExpectQuery("SHOW CREATE TABLE " + tableID).WillReturnRows(
+		sqlmock.NewRows([]string{"Table", "Create Table"}).
+			AddRow("test", ""+
+				"CREATE TABLE `t` ("+
+				"   `c` int(11) DEFAULT NULL"+
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin /*T![placement] PLACEMENT POLICY=`acdc` */;"))
+	_, err = tracker.GetDownStreamTableInfo(tcontext.Background(), tableID, oriTi)
+	c.Assert(err, IsNil)
+	_, ok := tracker.dsTracker.tableInfos[tableID]
+	c.Assert(ok, IsTrue)
+}
+
+func TestNewTmpFolderForTracker(t *testing.T) {
+	got, err := newTmpFolderForTracker("task/db01")
+	require.NoError(t, err)
+	require.Contains(t, got, "task%2Fdb01")
+	require.DirExists(t, got)
+	err = os.RemoveAll(got)
+	require.NoError(t, err)
 }

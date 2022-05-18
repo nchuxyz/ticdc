@@ -18,18 +18,18 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"go.etcd.io/etcd/clientv3"
+	"github.com/pingcap/tidb/util/dbutil"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/ticdc/dm/dm/common"
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/pkg/conn"
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
-	"github.com/pingcap/ticdc/dm/pkg/cputil"
-	"github.com/pingcap/ticdc/dm/pkg/etcdutil"
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/dm/common"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/pkg/conn"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/cputil"
+	"github.com/pingcap/tiflow/dm/pkg/etcdutil"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 // upgrades records all functions used to upgrade from one version to the later version.
@@ -197,7 +197,7 @@ func upgradeToVer2(cli *clientv3.Client, uctx Context) error {
 	defer cancel()
 
 	for tableName, cfg := range dbConfigs {
-		targetDB, err := conn.DefaultDBProvider.Apply(cfg)
+		targetDB, err := conn.DefaultDBProvider.Apply(&cfg)
 		if err != nil {
 			logger.Error("target DB error when upgrading", zap.String("table name", tableName))
 			return err
@@ -266,7 +266,7 @@ func upgradeToVer3(ctx context.Context, cli *clientv3.Client) error {
 		// delete old key to provide idempotence
 		ops = append(ops, clientv3.OpDelete(pair.old.Path(), clientv3.WithPrefix()))
 	}
-	_, _, err := etcdutil.DoOpsInOneTxnWithRetry(cli, ops...)
+	_, _, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(ops...))
 	return err
 }
 

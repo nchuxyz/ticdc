@@ -17,13 +17,13 @@ import (
 	"context"
 	"encoding/json"
 
-	"go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/clientv3/clientv3util"
-	"go.etcd.io/etcd/mvcc/mvccpb"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/clientv3util"
 
-	"github.com/pingcap/ticdc/dm/dm/common"
-	"github.com/pingcap/ticdc/dm/pkg/etcdutil"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/dm/common"
+	"github.com/pingcap/tiflow/dm/pkg/etcdutil"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 // Info represents the shard DDL information.
@@ -108,8 +108,8 @@ func PutInfoIfOpNotDone(cli *clientv3.Client, info Info) (rev int64, putted bool
 	opGet := clientv3.OpGet(opKey)
 
 	// try to PUT info if the operation not exist.
-	resp, rev, err := etcdutil.DoOpsInOneCmpsTxnWithRetry(cli, []clientv3.Cmp{clientv3util.KeyMissing(opKey)},
-		[]clientv3.Op{infoPut}, []clientv3.Op{opGet})
+	resp, rev, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.FullOpFunc([]clientv3.Cmp{clientv3util.KeyMissing(opKey)},
+		[]clientv3.Op{infoPut}, []clientv3.Op{opGet}))
 	if err != nil {
 		return 0, false, err
 	} else if resp.Succeeded {
@@ -130,7 +130,7 @@ func PutInfoIfOpNotDone(cli *clientv3.Client, info Info) (rev int64, putted bool
 
 	// NOTE: try to PUT info if the operation still not done.
 	opNotDone := clientv3.Compare(clientv3.Value(opKey), "=", string(opsResp.Kvs[0].Value))
-	resp, rev, err = etcdutil.DoOpsInOneCmpsTxnWithRetry(cli, []clientv3.Cmp{opNotDone}, []clientv3.Op{infoPut}, []clientv3.Op{})
+	resp, rev, err = etcdutil.DoTxnWithRepeatable(cli, etcdutil.FullOpFunc([]clientv3.Cmp{opNotDone}, []clientv3.Op{infoPut}, []clientv3.Op{}))
 	if err != nil {
 		return 0, false, err
 	}

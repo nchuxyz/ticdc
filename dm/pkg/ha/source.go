@@ -15,14 +15,15 @@ package ha
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/pingcap/failpoint"
-	"go.etcd.io/etcd/clientv3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/pingcap/ticdc/dm/dm/common"
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/pkg/etcdutil"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/dm/common"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/pkg/etcdutil"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
 )
 
 // PutSourceCfg puts the config of the upstream source into etcd.
@@ -33,7 +34,7 @@ func PutSourceCfg(cli *clientv3.Client, cfg *config.SourceConfig) (int64, error)
 		return 0, err
 	}
 	key := common.UpstreamConfigKeyAdapter.Encode(cfg.SourceID)
-	_, rev, err := etcdutil.DoOpsInOneTxnWithRetry(cli, clientv3.OpPut(key, value))
+	_, rev, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(clientv3.OpPut(key, value)))
 	return rev, err
 }
 
@@ -51,7 +52,7 @@ func GetAllSourceCfgBeforeV202(cli *clientv3.Client) (map[string]*config.SourceC
 	resp, err = cli.Get(ctx, common.UpstreamConfigKeyAdapterV1.Path(), clientv3.WithPrefix())
 
 	if err != nil {
-		return scm, 0, err
+		return scm, 0, terror.ErrHAFailTxnOperation.Delegate(err, "fail to get upstream source configs <= v2.0.2")
 	}
 
 	scm, err = sourceCfgFromResp("", resp)
@@ -86,7 +87,7 @@ func GetSourceCfg(cli *clientv3.Client, source string, rev int64) (map[string]*c
 	}
 
 	if err != nil {
-		return scm, 0, err
+		return scm, 0, terror.ErrHAFailTxnOperation.Delegate(err, fmt.Sprintf("fail get upstream source configs, source %s", source))
 	}
 
 	scm, err = sourceCfgFromResp(source, resp)
@@ -134,8 +135,10 @@ func ClearTestInfoOperation(cli *clientv3.Client) error {
 	clearRelayStage := clientv3.OpDelete(common.StageRelayKeyAdapter.Path(), clientv3.WithPrefix())
 	clearRelayConfig := clientv3.OpDelete(common.UpstreamRelayWorkerKeyAdapter.Path(), clientv3.WithPrefix())
 	clearSubTaskStage := clientv3.OpDelete(common.StageSubTaskKeyAdapter.Path(), clientv3.WithPrefix())
+	clearValidatorStage := clientv3.OpDelete(common.StageValidatorKeyAdapter.Path(), clientv3.WithPrefix())
 	clearLoadTasks := clientv3.OpDelete(common.LoadTaskKeyAdapter.Path(), clientv3.WithPrefix())
-	_, _, err := etcdutil.DoOpsInOneTxnWithRetry(cli, clearSource, clearSubTask, clearWorkerInfo, clearBound,
-		clearLastBound, clearWorkerKeepAlive, clearRelayStage, clearRelayConfig, clearSubTaskStage, clearLoadTasks)
+	_, _, err := etcdutil.DoTxnWithRepeatable(cli, etcdutil.ThenOpFunc(clearSource, clearSubTask, clearWorkerInfo,
+		clearBound, clearLastBound, clearWorkerKeepAlive, clearRelayStage, clearRelayConfig, clearSubTaskStage,
+		clearValidatorStage, clearLoadTasks))
 	return err
 }

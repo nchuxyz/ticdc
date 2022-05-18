@@ -18,22 +18,29 @@ import (
 	"sync/atomic"
 
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/model"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/sink/metrics"
 	"go.uber.org/zap"
 )
 
-// newBlackHoleSink creates a block hole sink
-func newBlackHoleSink(ctx context.Context, opts map[string]string) *blackHoleSink {
+// newBlackHoleSink creates a black hole sink
+func newBlackHoleSink(ctx context.Context) *blackHoleSink {
 	return &blackHoleSink{
-		statistics: NewStatistics(ctx, "blackhole", opts),
+		// use `SinkTypeDB` to record metrics
+		statistics: metrics.NewStatistics(ctx, metrics.SinkTypeDB),
 	}
 }
 
 type blackHoleSink struct {
-	statistics      *Statistics
-	checkpointTs    uint64
+	statistics      *metrics.Statistics
 	accumulated     uint64
 	lastAccumulated uint64
+}
+
+var _ Sink = (*blackHoleSink)(nil)
+
+func (b *blackHoleSink) AddTable(tableID model.TableID) error {
+	return nil
 }
 
 func (b *blackHoleSink) EmitRowChangedEvents(ctx context.Context, rows ...*model.RowChangedEvent) error {
@@ -46,8 +53,10 @@ func (b *blackHoleSink) EmitRowChangedEvents(ctx context.Context, rows ...*model
 	return nil
 }
 
-func (b *blackHoleSink) FlushRowChangedEvents(ctx context.Context, resolvedTs uint64) (uint64, error) {
-	log.Debug("BlockHoleSink: FlushRowChangedEvents", zap.Uint64("resolvedTs", resolvedTs))
+func (b *blackHoleSink) FlushRowChangedEvents(
+	ctx context.Context, _ model.TableID, resolved model.ResolvedTs,
+) (uint64, error) {
+	log.Debug("BlockHoleSink: FlushRowChangedEvents", zap.Uint64("resolvedTs", resolved.Ts))
 	err := b.statistics.RecordBatchExecution(func() (int, error) {
 		// TODO: add some random replication latency
 		accumulated := atomic.LoadUint64(&b.accumulated)
@@ -56,12 +65,11 @@ func (b *blackHoleSink) FlushRowChangedEvents(ctx context.Context, resolvedTs ui
 		return int(batchSize), nil
 	})
 	b.statistics.PrintStatus(ctx)
-	atomic.StoreUint64(&b.checkpointTs, resolvedTs)
-	return resolvedTs, err
+	return resolved.Ts, err
 }
 
-func (b *blackHoleSink) EmitCheckpointTs(ctx context.Context, ts uint64) error {
-	log.Debug("BlockHoleSink: Checkpoint Event", zap.Uint64("ts", ts))
+func (b *blackHoleSink) EmitCheckpointTs(ctx context.Context, ts uint64, tables []model.TableName) error {
+	log.Debug("BlockHoleSink: Checkpoint Event", zap.Uint64("ts", ts), zap.Any("tables", tables))
 	return nil
 }
 
@@ -70,15 +78,10 @@ func (b *blackHoleSink) EmitDDLEvent(ctx context.Context, ddl *model.DDLEvent) e
 	return nil
 }
 
-// Initialize is no-op for blackhole
-func (b *blackHoleSink) Initialize(ctx context.Context, tableInfo []*model.SimpleTableInfo) error {
-	return nil
-}
-
 func (b *blackHoleSink) Close(ctx context.Context) error {
 	return nil
 }
 
-func (b *blackHoleSink) Barrier(ctx context.Context) error {
+func (b *blackHoleSink) RemoveTable(ctx context.Context, tableID model.TableID) error {
 	return nil
 }

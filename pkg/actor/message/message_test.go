@@ -17,7 +17,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/pingcap/ticdc/pkg/leakutil"
+	"github.com/pingcap/tiflow/pkg/leakutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,16 +28,6 @@ func TestMain(m *testing.M) {
 // Make sure Message can be printed in JSON format, so that it can be logged by
 // pingcap/log package.
 func TestJSONPrint(t *testing.T) {
-	_, err := json.Marshal(Message{})
+	_, err := json.Marshal(Message[any]{})
 	require.Nil(t, err)
-}
-
-func TestTickMessage(t *testing.T) {
-	msg := TickMessage()
-	require.Equal(t, TypeTick, msg.Tp)
-}
-
-func TestBarrierMessage(t *testing.T) {
-	msg := BarrierMessage(1)
-	require.Equal(t, TypeBarrier, msg.Tp)
 }

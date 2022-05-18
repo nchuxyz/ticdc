@@ -18,17 +18,20 @@ import (
 	"database/sql"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	. "github.com/pingcap/check"
 	bf "github.com/pingcap/tidb-tools/pkg/binlog-filter"
-	"github.com/pingcap/tidb-tools/pkg/filter"
 	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/util/filter"
+	"github.com/pingcap/tiflow/dm/pkg/binlog"
 
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/pkg/conn"
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
-	"github.com/pingcap/ticdc/dm/pkg/schema"
-	"github.com/pingcap/ticdc/dm/syncer/dbconn"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/pkg/conn"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/schema"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/syncer/dbconn"
 )
 
 type testFilterSuite struct {
@@ -65,10 +68,11 @@ func (s *testFilterSuite) TestSkipQueryEvent(c *C) {
 	syncer.baList, err = filter.New(syncer.cfg.CaseSensitive, syncer.cfg.BAList)
 	c.Assert(err, IsNil)
 
-	syncer.ddlDBConn = &dbconn.DBConn{Cfg: syncer.cfg, BaseConn: s.baseConn}
-	syncer.schemaTracker, err = schema.NewTracker(context.Background(), syncer.cfg.Name, defaultTestSessionCfg, syncer.ddlDBConn.BaseConn)
+	syncer.ddlDBConn = dbconn.NewDBConn(syncer.cfg, s.baseConn)
+	syncer.schemaTracker, err = schema.NewTracker(context.Background(), syncer.cfg.Name, defaultTestSessionCfg, syncer.ddlDBConn)
 	c.Assert(err, IsNil)
-	syncer.exprFilterGroup = NewExprFilterGroup(nil)
+	defer syncer.schemaTracker.Close()
+	syncer.exprFilterGroup = NewExprFilterGroup(utils.NewSessionCtx(nil), nil)
 
 	// test binlog filter
 	filterRules := []*bf.BinlogEventRule{
@@ -124,12 +128,19 @@ func (s *testFilterSuite) TestSkipQueryEvent(c *C) {
 		},
 	}
 	p := parser.New()
-	qec := &queryEventContext{
-		eventContext: &eventContext{tctx: tcontext.Background()},
-		p:            p,
-	}
+
+	loc := binlog.NewLocation(mysql.MySQLFlavor)
+
 	for _, ca := range cases {
-		ddlInfo, err := syncer.genDDLInfo(p, ca.schema, ca.sql)
+		qec := &queryEventContext{
+			eventContext: &eventContext{
+				tctx:         tcontext.Background(),
+				lastLocation: &loc,
+			},
+			p:         p,
+			ddlSchema: ca.schema,
+		}
+		ddlInfo, err := syncer.genDDLInfo(qec, ca.sql)
 		c.Assert(err, IsNil)
 		qec.ddlSchema = ca.schema
 		qec.originSQL = ca.sql

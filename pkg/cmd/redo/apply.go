@@ -14,17 +14,15 @@
 package redo
 
 import (
-	"github.com/pingcap/ticdc/pkg/applier"
-	cmdcontext "github.com/pingcap/ticdc/pkg/cmd/context"
+	"github.com/pingcap/tiflow/pkg/applier"
+	cmdcontext "github.com/pingcap/tiflow/pkg/cmd/context"
 	"github.com/spf13/cobra"
 )
 
 // applyRedoOptions defines flags for the `redo apply` command.
 type applyRedoOptions struct {
-	storage string
+	options
 	sinkURI string
-	dir     string
-	s3URI   string
 }
 
 // newapplyRedoOptions creates new applyRedoOptions for the `redo apply` command.
@@ -35,12 +33,8 @@ func newapplyRedoOptions() *applyRedoOptions {
 // addFlags receives a *cobra.Command reference and binds
 // flags related to template printing to it.
 func (o *applyRedoOptions) addFlags(cmd *cobra.Command) {
-	cmd.Flags().StringVar(&o.storage, "storage", "", "storage of redo log")
 	cmd.Flags().StringVar(&o.sinkURI, "sink-uri", "", "target database sink-uri")
-	cmd.Flags().StringVar(&o.dir, "dir", "", "local path of redo log")
-	cmd.Flags().StringVar(&o.s3URI, "s3-uri", "", "s3 uri of redo log")
 	// the possible error returned from MarkFlagRequired is `no such flag`
-	cmd.MarkFlagRequired("storage")  //nolint:errcheck
 	cmd.MarkFlagRequired("sink-uri") //nolint:errcheck
 }
 
@@ -52,7 +46,6 @@ func (o *applyRedoOptions) run(cmd *cobra.Command) error {
 		Storage: o.storage,
 		SinkURI: o.sinkURI,
 		Dir:     o.dir,
-		S3URI:   o.s3URI,
 	}
 	ap := applier.NewRedoApplier(cfg)
 	err := ap.Apply(ctx)
@@ -64,12 +57,13 @@ func (o *applyRedoOptions) run(cmd *cobra.Command) error {
 }
 
 // newCmdApply creates the `redo apply` command.
-func newCmdApply() *cobra.Command {
+func newCmdApply(opt *options) *cobra.Command {
 	o := newapplyRedoOptions()
 	command := &cobra.Command{
 		Use:   "apply",
 		Short: "Apply redo logs in target sink",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			o.options = *opt
 			return o.run(cmd)
 		},
 	}

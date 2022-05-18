@@ -24,22 +24,25 @@ import (
 	"sync/atomic"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/pingcap/failpoint"
-
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/pkg/retry"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
-
 	"github.com/go-sql-driver/mysql"
+	perrors "github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	toolutils "github.com/pingcap/tidb-tools/pkg/utils"
+	"go.uber.org/zap"
+
+	"github.com/pingcap/tiflow/dm/dm/config"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/retry"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 var customID int64
 
 // DBProvider providers BaseDB instance.
 type DBProvider interface {
-	Apply(config config.DBConfig) (*BaseDB, error)
+	Apply(config *config.DBConfig) (*BaseDB, error)
 }
 
 // DefaultDBProviderImpl is default DBProvider implement.
@@ -56,7 +59,7 @@ func init() {
 var mockDB sqlmock.Sqlmock
 
 // Apply will build BaseDB with DBConfig.
-func (d *DefaultDBProviderImpl) Apply(config config.DBConfig) (*BaseDB, error) {
+func (d *DefaultDBProviderImpl) Apply(config *config.DBConfig) (*BaseDB, error) {
 	// maxAllowedPacket=0 can be used to automatically fetch the max_allowed_packet variable from server on every connection.
 	// https://github.com/go-sql-driver/mysql#maxallowedpacket
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4&interpolateParams=true&maxAllowedPacket=0",
@@ -148,11 +151,11 @@ type BaseDB struct {
 	Retry retry.Strategy
 
 	// this function will do when close the BaseDB
-	doFuncInClose func()
+	doFuncInClose []func()
 }
 
 // NewBaseDB returns *BaseDB object.
-func NewBaseDB(db *sql.DB, doFuncInClose func()) *BaseDB {
+func NewBaseDB(db *sql.DB, doFuncInClose ...func()) *BaseDB {
 	conns := make(map[*BaseConn]struct{})
 	return &BaseDB{DB: db, conns: conns, Retry: &retry.FiniteRetryStrategy{}, doFuncInClose: doFuncInClose}
 }
@@ -174,12 +177,74 @@ func (d *BaseDB) GetBaseConn(ctx context.Context) (*BaseConn, error) {
 	return baseConn, nil
 }
 
+func (d *BaseDB) ExecContext(tctx *tcontext.Context, query string, args ...interface{}) (sql.Result, error) {
+	if tctx.L().Core().Enabled(zap.DebugLevel) {
+		tctx.L().Debug("exec context",
+			zap.String("query", utils.TruncateString(query, -1)),
+			zap.String("argument", utils.TruncateInterface(args, -1)))
+	}
+	return d.DB.ExecContext(tctx.Ctx, query, args...)
+}
+
+func (d *BaseDB) QueryContext(tctx *tcontext.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	if tctx.L().Core().Enabled(zap.DebugLevel) {
+		tctx.L().Debug("query context",
+			zap.String("query", utils.TruncateString(query, -1)),
+			zap.String("argument", utils.TruncateInterface(args, -1)))
+	}
+	return d.DB.QueryContext(tctx.Ctx, query, args...)
+}
+
+func (d *BaseDB) DoTxWithRetry(tctx *tcontext.Context, queries []string, args [][]interface{}, retryer retry.Retryer) error {
+	workFunc := func(tctx *tcontext.Context) (interface{}, error) {
+		var (
+			err error
+			tx  *sql.Tx
+		)
+		tx, err = d.DB.BeginTx(tctx.Ctx, nil)
+		if err != nil {
+			return nil, perrors.Trace(err)
+		}
+		defer func() {
+			if err != nil {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					tctx.L().Warn("failed to rollback", zap.Error(perrors.Trace(rollbackErr)))
+				}
+			} else {
+				err = tx.Commit()
+			}
+		}()
+		for i := range queries {
+			q := queries[i]
+			if tctx.L().Core().Enabled(zap.DebugLevel) {
+				tctx.L().Debug("exec in tx",
+					zap.String("query", utils.TruncateString(q, -1)),
+					zap.String("argument", utils.TruncateInterface(args[i], -1)))
+			}
+			if _, err = tx.ExecContext(tctx.Ctx, q, args[i]...); err != nil {
+				return nil, perrors.Trace(err)
+			}
+		}
+		return nil, perrors.Trace(err)
+	}
+
+	_, _, err := retryer.Apply(tctx, workFunc)
+	return err
+}
+
 // CloseBaseConn release BaseConn resource from BaseDB, and close BaseConn.
 func (d *BaseDB) CloseBaseConn(conn *BaseConn) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.conns, conn)
 	return conn.close()
+}
+
+// CloseBaseConnWithoutErr close the base connect and output a warn log if meets an error.
+func CloseBaseConnWithoutErr(d *BaseDB, conn *BaseConn) {
+	if err1 := d.CloseBaseConn(conn); err1 != nil {
+		log.L().Warn("close db connection failed", zap.Error(err1))
+	}
 }
 
 // Close release *BaseDB resource.
@@ -197,7 +262,9 @@ func (d *BaseDB) Close() error {
 		}
 	}
 	terr := d.DB.Close()
-	d.doFuncInClose()
+	for _, f := range d.doFuncInClose {
+		f()
+	}
 
 	if err == nil {
 		return terr

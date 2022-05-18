@@ -3,6 +3,12 @@ name: DM Binlog 999999
 on:
   schedule:
     - cron: '0 17-23 * * *' # run at minute 0 every hour from 01:00 ~ 07:00 UTC+8
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Which PR do you want to trigger'
+        required: true
+        default: ''
 
 jobs:
   test-binlog-999999:
@@ -10,13 +16,19 @@ jobs:
     runs-on: ubuntu-18.04
 
     steps:
-      - name: Set up Go 1.16
-        uses: actions/setup-go@v2
+      - name: Set up Go 1.18
+        uses: actions/setup-go@v3
         with:
-          go-version: 1.16
+          go-version: 1.18
 
       - name: Check out code
         uses: actions/checkout@v2
+
+      - name: Check out code by workflow dispatch
+        if: ${{ github.event.inputs.pr != '' }}
+        uses: actions/checkout@v2
+        with:
+          ref: refs/pull/${{ github.event.inputs.pr }}/head
 
       - name: Cache go modules
         uses: actions/cache@v2
@@ -41,6 +53,9 @@ jobs:
           mv tidb-enterprise-tools-nightly-linux-amd64/bin/sync_diff_inspector bin/
           curl http://download.pingcap.org/tidb-nightly-linux-amd64.tar.gz | tar xz
           mv tidb-nightly-linux-amd64/bin/tidb-server bin/
+          curl -O https://dl.min.io/server/minio/release/linux-amd64/minio
+          chmod +x minio
+          mv minio bin/
 
       - name: change binlog sequence number to 999998
         run: |
@@ -105,10 +120,4 @@ jobs:
           SLACK_WEBHOOK: ${{ secrets.SLACK_NOTIFY }}
         uses: Ilshidur/action-slack@2.1.0
         with:
-          args: "chaos job failed, see https://github.com/pingcap/ticdc/actions/runs/{{ GITHUB_RUN_ID }}"
-
-      # Debug via SSH if previous steps failed
-      - name: Set up tmate session
-        if: ${{ failure() }}
-        uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 30
+          args: "binlog 999999 failed, see https://github.com/pingcap/tiflow/actions/runs/{{ GITHUB_RUN_ID }}"

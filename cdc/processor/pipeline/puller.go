@@ -17,13 +17,16 @@ import (
 	"context"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/cdc/puller"
-	cdcContext "github.com/pingcap/ticdc/pkg/context"
-	"github.com/pingcap/ticdc/pkg/pipeline"
-	"github.com/pingcap/ticdc/pkg/regionspan"
-	"github.com/pingcap/ticdc/pkg/util"
-	"github.com/tikv/client-go/v2/oracle"
+	"github.com/pingcap/tiflow/cdc/contextutil"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/puller"
+	"github.com/pingcap/tiflow/pkg/config"
+	cdcContext "github.com/pingcap/tiflow/pkg/context"
+	"github.com/pingcap/tiflow/pkg/pipeline"
+	pmessage "github.com/pingcap/tiflow/pkg/pipeline/message"
+	"github.com/pingcap/tiflow/pkg/regionspan"
+	"github.com/pingcap/tiflow/pkg/upstream"
+	"github.com/pingcap/tiflow/pkg/util"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -32,16 +35,21 @@ type pullerNode struct {
 
 	tableID     model.TableID
 	replicaInfo *model.TableReplicaInfo
+	changefeed  model.ChangeFeedID
 	cancel      context.CancelFunc
-	wg          errgroup.Group
+	wg          *errgroup.Group
 }
 
 func newPullerNode(
-	tableID model.TableID, replicaInfo *model.TableReplicaInfo, tableName string) pipeline.Node {
+	tableID model.TableID, replicaInfo *model.TableReplicaInfo,
+	tableName string,
+	changefeed model.ChangeFeedID,
+) *pullerNode {
 	return &pullerNode{
 		tableID:     tableID,
 		replicaInfo: replicaInfo,
 		tableName:   tableName,
+		changefeed:  changefeed,
 	}
 }
 
@@ -58,15 +66,31 @@ func (n *pullerNode) tableSpan(ctx cdcContext.Context) []regionspan.Span {
 }
 
 func (n *pullerNode) Init(ctx pipeline.NodeContext) error {
-	metricTableResolvedTsGauge := tableResolvedTsGauge.WithLabelValues(ctx.ChangefeedVars().ID, ctx.GlobalVars().CaptureInfo.AdvertiseAddr, n.tableName)
+	return n.start(ctx, nil, new(errgroup.Group), false, nil)
+}
+
+func (n *pullerNode) start(ctx pipeline.NodeContext, upStream *upstream.Upstream, wg *errgroup.Group, isActorMode bool, sorter *sorterNode) error {
+	n.wg = wg
 	ctxC, cancel := context.WithCancel(ctx)
-	ctxC = util.PutTableInfoInCtx(ctxC, n.tableID, n.tableName)
-	ctxC = util.PutCaptureAddrInCtx(ctxC, ctx.GlobalVars().CaptureInfo.AdvertiseAddr)
-	ctxC = util.PutChangefeedIDInCtx(ctxC, ctx.ChangefeedVars().ID)
+	ctxC = contextutil.PutTableInfoInCtx(ctxC, n.tableID, n.tableName)
+	ctxC = contextutil.PutCaptureAddrInCtx(ctxC, ctx.GlobalVars().CaptureInfo.AdvertiseAddr)
+	ctxC = contextutil.PutChangefeedIDInCtx(ctxC, ctx.ChangefeedVars().ID)
+	ctxC = contextutil.PutRoleInCtx(ctxC, util.RoleProcessor)
+	kvCfg := config.GetGlobalServerConfig().KVClient
 	// NOTICE: always pull the old value internally
-	// See also: TODO(hi-rustin): add issue link here.
-	plr := puller.NewPuller(ctxC, ctx.GlobalVars().PDClient, ctx.GlobalVars().GrpcPool, ctx.GlobalVars().KVStorage,
-		n.replicaInfo.StartTs, n.tableSpan(ctx), true)
+	// See also: https://github.com/pingcap/tiflow/issues/2301.
+	plr := puller.NewPuller(
+		ctxC,
+		upStream.PDClient,
+		upStream.GrpcPool,
+		upStream.RegionCache,
+		upStream.KVStorage,
+		upStream.PDClock,
+		n.changefeed,
+		n.replicaInfo.StartTs,
+		n.tableSpan(ctx),
+		kvCfg,
+	)
 	n.wg.Go(func() error {
 		ctx.Throw(errors.Trace(plr.Run(ctxC)))
 		return nil
@@ -80,11 +104,12 @@ func (n *pullerNode) Init(ctx pipeline.NodeContext) error {
 				if rawKV == nil {
 					continue
 				}
-				if rawKV.OpType == model.OpTypeResolved {
-					metricTableResolvedTsGauge.Set(float64(oracle.ExtractPhysical(rawKV.CRTs)))
-				}
 				pEvent := model.NewPolymorphicEvent(rawKV)
-				ctx.SendToNextNode(pipeline.PolymorphicEventMessage(pEvent))
+				if isActorMode {
+					sorter.handleRawEvent(ctx, pEvent)
+				} else {
+					ctx.SendToNextNode(pmessage.PolymorphicEventMessage(pEvent))
+				}
 			}
 		}
 	})
@@ -100,7 +125,6 @@ func (n *pullerNode) Receive(ctx pipeline.NodeContext) error {
 }
 
 func (n *pullerNode) Destroy(ctx pipeline.NodeContext) error {
-	tableResolvedTsGauge.DeleteLabelValues(ctx.ChangefeedVars().ID, ctx.GlobalVars().CaptureInfo.AdvertiseAddr, n.tableName)
 	n.cancel()
 	return n.wg.Wait()
 }

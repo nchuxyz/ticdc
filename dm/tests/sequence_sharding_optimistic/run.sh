@@ -33,12 +33,6 @@ run() {
 	dmctl_operate_source create $WORK_DIR/source1.yaml $SOURCE_ID1
 	dmctl_operate_source create $WORK_DIR/source2.yaml $SOURCE_ID2
 
-	worker1bound=$($PWD/bin/dmctl.test DEVEL --master-addr "127.0.0.1:$MASTER_PORT1" list-member --name worker1 |
-		grep 'source' | awk -F: '{print $2}' | cut -d'"' -f 2)
-	run_dm_ctl_with_retry $WORK_DIR "127.0.0.1:$MASTER_PORT" \
-		"start-relay -s $worker1bound worker1" \
-		"\"result\": true" 1
-
 	# try to get schema for the table, the subtask has not started.
 	curl -X PUT ${API_URL} -d '{"op":1, "task":"sequence_sharding_optimistic", "sources": ["mysql-replica-01"], "database":"sharding_seq_opt", "table":"t1"}' >${WORK_DIR}/get_schema.log
 	check_log_contains ${WORK_DIR}/get_schema.log "sub task with name sequence_sharding_optimistic not found" 1
@@ -70,9 +64,9 @@ run() {
 		"query-status $task_name" \
 		"\"stage\": \"Paused\"" 2
 
-	# try to get schema for the table, but can't get because no DDL/DML replicated yet.
+	# try to get schema for the table, table exists for optimistic.
 	curl -X PUT ${API_URL} -d '{"op":1, "task":"sequence_sharding_optimistic", "sources": ["mysql-replica-01"], "database":"sharding_seq_opt", "table":"t1"}' >${WORK_DIR}/get_schema.log
-	check_log_contains ${WORK_DIR}/get_schema.log "Table 'sharding_seq_opt.t1' doesn't exist" 1
+	check_log_contains ${WORK_DIR}/get_schema.log 'CREATE TABLE `t1` ( `id` bigint(20) NOT NULL, `c1` varchar(20) DEFAULT NULL, `c2` varchar(20) DEFAULT NULL, PRIMARY KEY (`id`) .*) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_bin' 1
 
 	# resume task manually.
 	run_dm_ctl_with_retry $WORK_DIR "127.0.0.1:$MASTER_PORT" \
@@ -84,7 +78,7 @@ run() {
 
 	# now, for optimistic shard DDL, different sources will reach a stage often not at the same time,
 	# in order to simply the check and resume flow, only enable the failpoint for one DM-worker.
-	export GO_FAILPOINTS="github.com/pingcap/ticdc/dm/syncer/FlushCheckpointStage=return(100)" # for all stages
+	export GO_FAILPOINTS="github.com/pingcap/tiflow/dm/syncer/FlushCheckpointStage=return(100)" # for all stages
 	echo "restart dm-worker1"
 	ps aux | grep dm-worker1 | awk '{print $2}' | xargs kill || true
 	check_port_offline $WORKER1_PORT 20
@@ -95,10 +89,6 @@ run() {
 	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
 		"shard-ddl-lock unlock non-exist-task-\`test_db\`.\`test_table\`" \
 		"lock with ID non-exist-task-\`test_db\`.\`test_table\` not found" 1
-
-	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
-		"shard-ddl-lock unlock $task_name-\`shard_db\`.\`shard_table\`" \
-		"\`unlock-ddl-lock\` is only supported in pessimistic shard mode currently" 1
 
 	run_sql_file $cur/data/db1.increment.sql $MYSQL_HOST1 $MYSQL_PORT1 $MYSQL_PASSWORD1
 	run_sql_file $cur/data/db2.increment.sql $MYSQL_HOST2 $MYSQL_PORT2 $MYSQL_PASSWORD2
@@ -164,20 +154,16 @@ run() {
 	# drop the schema.
 	curl -X PUT ${API_URL} -d '{"op":3, "task":"sequence_sharding_optimistic", "sources": ["mysql-replica-01"], "database":"sharding_seq_opt", "table":"t1"}' >${WORK_DIR}/remove_schema.log
 
-	# try to get schema again, but can't get.
-	curl -X PUT ${API_URL} -d '{"op":1, "task":"sequence_sharding_optimistic", "sources": ["mysql-replica-01"], "database":"sharding_seq_opt", "table":"t1"}' >${WORK_DIR}/get_schema.log
-	check_log_contains ${WORK_DIR}/get_schema.log "Table 'sharding_seq_opt.t1' doesn't exist" 1
-
 	# try to set an invalid schema.
 	curl -X PUT ${API_URL} -d '{"op":2, "task":"sequence_sharding_optimistic", "sources": ["mysql-replica-01"], "database":"sharding_seq_opt", "table":"t1", "schema":"invalid create table statement"}' >${WORK_DIR}/get_schema.log >${WORK_DIR}/set_schema.log
 	check_log_contains ${WORK_DIR}/set_schema.log 'is not a valid `CREATE TABLE` statement' 1
 
-	# try to get schema again, no one exist.
+	# try to get schema again, still the old schema.
 	curl -X PUT ${API_URL} -d '{"op":1, "task":"sequence_sharding_optimistic", "sources": ["mysql-replica-01"], "database":"sharding_seq_opt", "table":"t1"}' >${WORK_DIR}/get_schema.log
-	check_log_contains ${WORK_DIR}/get_schema.log "Table 'sharding_seq_opt.t1' doesn't exist" 1
+	check_log_contains ${WORK_DIR}/get_schema.log 'CREATE TABLE `t1` ( `id` bigint(20) NOT NULL, `c2` varchar(20) DEFAULT NULL, `c3` int(11) DEFAULT NULL, PRIMARY KEY (`id`) .*) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_bin' 1
 
 	run_dm_ctl $WORK_DIR "127.0.0.1:$MASTER_PORT" \
-		"binlog-schema -s mysql-replica-01,mysql-replica-02 sequence_sharding_optimistic sharding_seq_opt t2" \
+		"binlog-schema list -s mysql-replica-01,mysql-replica-02 sequence_sharding_optimistic sharding_seq_opt t2" \
 		"\"result\": true" 3
 
 	# try to set another schema, `c3` `int` -> `bigint`.

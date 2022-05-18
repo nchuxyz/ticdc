@@ -15,8 +15,8 @@ package cyclic
 
 import (
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/pkg/cyclic/mark"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/pkg/cyclic/mark"
 	"go.uber.org/zap"
 )
 
@@ -80,7 +80,7 @@ func FilterAndReduceTxns(
 						event.RowID != first.RowID {
 						log.Panic(
 							"there should be at most one mark row for each txn",
-							zap.Uint64("start-ts", event.StartTs),
+							zap.Uint64("startTs", event.StartTs),
 							zap.Any("first", first),
 							zap.Any("second", event))
 					}

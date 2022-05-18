@@ -23,16 +23,16 @@ import (
 
 	"github.com/chaos-mesh/go-sqlsmith"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/util/dbutil"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	config2 "github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/dm/pb"
-	"github.com/pingcap/ticdc/dm/pkg/conn"
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	config2 "github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/dm/pb"
+	"github.com/pingcap/tiflow/dm/pkg/conn"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 const (
@@ -66,7 +66,8 @@ type task struct {
 
 // newTask creates a new task instance.
 func newTask(ctx context.Context, cli pb.MasterClient, taskFile string, schema string,
-	targetCfg config2.DBConfig, sourcesCfg ...config2.DBConfig) (*task, error) {
+	targetCfg config2.DBConfig, sourcesCfg ...config2.DBConfig,
+) (*task, error) {
 	var taskCfg config2.TaskConfig
 	err := taskCfg.DecodeFile(taskFile)
 	if err != nil {
@@ -86,7 +87,7 @@ func newTask(ctx context.Context, cli pb.MasterClient, taskFile string, schema s
 		}
 
 		cfg := sourcesCfg[i]
-		db, err2 := conn.DefaultDBProvider.Apply(cfg)
+		db, err2 := conn.DefaultDBProvider.Apply(&cfg)
 		if err2 != nil {
 			return nil, err2
 		}
@@ -110,7 +111,7 @@ func newTask(ctx context.Context, cli pb.MasterClient, taskFile string, schema s
 		res = append(res, singleResult{})
 	}
 
-	targetDB, err := conn.DefaultDBProvider.Apply(targetCfg)
+	targetDB, err := conn.DefaultDBProvider.Apply(&targetCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +184,7 @@ func (t *task) run() error {
 func (t *task) stopPreviousTask() error {
 	t.logger.Info("stopping previous task")
 	resp, err := t.cli.OperateTask(t.ctx, &pb.OperateTaskRequest{
-		Op:   pb.TaskOp_Stop,
+		Op:   pb.TaskOp_Delete,
 		Name: t.taskCfg.Name,
 	})
 	if err != nil {
@@ -293,7 +294,7 @@ func (t *task) incrLoop() error {
 
 	// execute preSQLs in upstream
 	for _, sql := range t.caseGenerator.GetPreSQLs() {
-		if err := t.sourceConns[sql.source].execDDLs(sql.statement); err != nil {
+		if err := t.sourceConns[sql.source].execDDLs(t.ctx, sql.statement); err != nil {
 			return err
 		}
 	}
@@ -363,7 +364,7 @@ func (t *task) genIncrData(pCtx context.Context) (err error) {
 		}
 		for _, testSQL := range testSQLs {
 			log.L().Info("execute test case sql", zap.String("ddl", testSQL.statement), zap.Int("source", testSQL.source))
-			if err2 := t.sourceConns[testSQL.source].execDDLs(testSQL.statement); err2 != nil {
+			if err2 := t.sourceConns[testSQL.source].execDDLs(t.ctx, testSQL.statement); err2 != nil {
 				return err2
 			}
 		}
@@ -401,7 +402,7 @@ func (t *task) genIncrData(pCtx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		if err = t.sourceConns[idx].execDDLs(query); err != nil {
+		if err = t.sourceConns[idx].execDDLs(t.ctx, query); err != nil {
 			return err
 		}
 
@@ -440,7 +441,7 @@ func (t *task) genIncrData(pCtx context.Context) (err error) {
 				conn2 := conn
 				i2 := i
 				eg.Go(func() error {
-					if err2 := conn2.execDDLs(query); err2 != nil {
+					if err2 := conn2.execDDLs(t.ctx, query); err2 != nil {
 						if utils.IsMySQLError(err2, mysql.ErrDupFieldName) {
 							t.logger.Warn("ignore duplicate field name for ddl", log.ShortError(err))
 							return nil

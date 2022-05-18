@@ -14,15 +14,17 @@
 package master
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 
+	"github.com/pingcap/tiflow/dm/dm/config"
 	"github.com/spf13/cobra"
 
-	"github.com/pingcap/ticdc/dm/checker"
-	"github.com/pingcap/ticdc/dm/dm/ctl/common"
-	"github.com/pingcap/ticdc/dm/dm/pb"
+	"github.com/pingcap/tiflow/dm/checker"
+	"github.com/pingcap/tiflow/dm/dm/ctl/common"
+	"github.com/pingcap/tiflow/dm/dm/pb"
 )
 
 // NewCheckTaskCmd creates a CheckTask command.
@@ -34,6 +36,7 @@ func NewCheckTaskCmd() *cobra.Command {
 	}
 	cmd.Flags().Int64P("error", "e", common.DefaultErrorCnt, "max count of errors to display")
 	cmd.Flags().Int64P("warn", "w", common.DefaultWarnCnt, "max count of warns to display")
+	cmd.Flags().String("start-time", "", "specify the start time of binlog replication, e.g. '2021-10-21 00:01:00' or 2021-10-21T00:01:00")
 	return cmd
 }
 
@@ -57,19 +60,55 @@ func checkTaskFunc(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	startTime, err := cmd.Flags().GetString("start-time")
+	if err != nil {
+		return err
+	}
+
+	lines := bytes.Split(content, []byte("\n"))
+	// we check if `is-sharding` is explicitly set, to distinguish between `false` from default value
+	isShardingSet := false
+	for i := range lines {
+		if bytes.HasPrefix(lines[i], []byte("is-sharding")) {
+			isShardingSet = true
+			break
+		}
+	}
+	// we check if `shard-mode` is explicitly set, to distinguish between "" from default value
+	shardModeSet := false
+	for i := range lines {
+		if bytes.HasPrefix(lines[i], []byte("shard-mode")) {
+			shardModeSet = true
+			break
+		}
+	}
+
+	task := config.NewTaskConfig()
+	yamlErr := task.RawDecode(string(content))
+	// if can't parse yaml, we ignore this check
+	if yamlErr == nil {
+		if isShardingSet && !task.IsSharding && task.ShardMode != "" {
+			common.PrintLinesf("The behaviour of `is-sharding` and `shard-mode` is conflicting. `is-sharding` is deprecated, please use `shard-mode` only.")
+			return errors.New("please check output to see error")
+		}
+		if shardModeSet && task.ShardMode == "" && task.IsSharding {
+			common.PrintLinesf("The behaviour of `is-sharding` and `shard-mode` is conflicting. `is-sharding` is deprecated, please use `shard-mode` only.")
+			return errors.New("please check output to see error")
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// start task
 	resp := &pb.CheckTaskResponse{}
 	err = common.SendRequest(
 		ctx,
 		"CheckTask",
 		&pb.CheckTaskRequest{
-			Task:    string(content),
-			ErrCnt:  errCnt,
-			WarnCnt: warnCnt,
+			Task:      string(content),
+			ErrCnt:    errCnt,
+			WarnCnt:   warnCnt,
+			StartTime: startTime,
 		},
 		&resp,
 	)
@@ -78,7 +117,7 @@ func checkTaskFunc(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	if !common.PrettyPrintResponseWithCheckTask(resp, checker.ErrorMsgHeader) {
+	if !common.PrettyPrintResponseWithCheckTask(resp, checker.CheckTaskMsgHeader) {
 		common.PrettyPrintResponse(resp)
 	}
 	return nil

@@ -16,12 +16,12 @@ package ha
 import (
 	"context"
 
-	"go.etcd.io/etcd/clientv3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/pingcap/ticdc/dm/dm/common"
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/pkg/etcdutil"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/dm/common"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/pkg/etcdutil"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
 )
 
 // GetSubTaskCfg gets the subtask config of the specified source and task name.
@@ -44,7 +44,7 @@ func GetSubTaskCfg(cli *clientv3.Client, source, task string, rev int64) (map[st
 	}
 
 	if err != nil {
-		return tsm, 0, err
+		return tsm, 0, terror.ErrHAFailTxnOperation.Delegate(err, "fail to get subtask config, source: %s, task: %s", source, task)
 	}
 
 	cfgs, err := subTaskCfgFromResp(source, task, resp)
@@ -64,7 +64,7 @@ func GetAllSubTaskCfg(cli *clientv3.Client) (map[string]map[string]config.SubTas
 
 	resp, err := cli.Get(ctx, common.UpstreamSubTaskKeyAdapter.Path(), clientv3.WithPrefix())
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, terror.ErrHAFailTxnOperation.Delegate(err, "fail to get all subtask configs")
 	}
 
 	cfgs, err := subTaskCfgFromResp("", "", resp)
@@ -94,6 +94,28 @@ func deleteSubTaskCfgOp(cfgs ...config.SubTaskConfig) []clientv3.Op {
 	ops := make([]clientv3.Op, 0, len(cfgs))
 	for _, cfg := range cfgs {
 		ops = append(ops, clientv3.OpDelete(common.UpstreamSubTaskKeyAdapter.Encode(cfg.SourceID, cfg.Name)))
+	}
+	return ops
+}
+
+func putValidatorStageOps(stages ...Stage) ([]clientv3.Op, error) {
+	ops := make([]clientv3.Op, 0, len(stages))
+	for _, stage := range stages {
+		key := common.StageValidatorKeyAdapter.Encode(stage.Source, stage.Task)
+		value, err := stage.toJSON()
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, clientv3.OpPut(key, value))
+	}
+	return ops, nil
+}
+
+func deleteValidatorStageOps(stages ...Stage) []clientv3.Op {
+	ops := make([]clientv3.Op, 0, len(stages))
+	for _, stage := range stages {
+		key := common.StageValidatorKeyAdapter.Encode(stage.Source, stage.Task)
+		ops = append(ops, clientv3.OpDelete(key))
 	}
 	return ops
 }

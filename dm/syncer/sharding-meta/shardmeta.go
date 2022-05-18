@@ -18,15 +18,15 @@ import (
 	"fmt"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"github.com/pingcap/tidb-tools/pkg/filter"
+	"github.com/pingcap/tidb/util/dbutil"
+	"github.com/pingcap/tidb/util/filter"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/ticdc/dm/pkg/binlog"
-	"github.com/pingcap/ticdc/dm/pkg/gtid"
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/pkg/binlog"
+	"github.com/pingcap/tiflow/dm/pkg/gtid"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 // DDLItem records ddl information used in sharding sequence organization.

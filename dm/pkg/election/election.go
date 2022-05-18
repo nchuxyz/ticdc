@@ -23,14 +23,14 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	"go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/clientv3/concurrency"
-	"go.etcd.io/etcd/mvcc/mvccpb"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
 )
 
 const (
@@ -246,9 +246,8 @@ func (e *Election) campaignLoop(ctx context.Context, session *concurrency.Sessio
 		elec := concurrency.NewElection(session, e.key)
 		ctx2, cancel2 := context.WithCancel(ctx)
 
-		campaignWg.Add(1)
-
 		e.campaignMu.Lock()
+		campaignWg.Add(1)
 		e.cancelCampaign = func() {
 			cancel2()
 			campaignWg.Wait()

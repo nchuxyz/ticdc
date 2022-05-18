@@ -19,9 +19,9 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	config2 "github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/dm/pb"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	config2 "github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/dm/pb"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 var (
@@ -34,7 +34,8 @@ var (
 
 // runCases runs test cases.
 func runCases(ctx context.Context, cli pb.MasterClient, confDir string,
-	targetCfg config2.DBConfig, sourcesCfg ...config2.DBConfig) error {
+	targetCfg config2.DBConfig, sourcesCfg ...config2.DBConfig,
+) error {
 	eg, ctx2 := errgroup.WithContext(ctx)
 	for i := range filenames {
 		taskFile := filepath.Join(confDir, filenames[i])

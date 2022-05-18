@@ -21,15 +21,14 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/util/dbutil"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/ticdc/dm/pkg/conn"
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/retry"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/pkg/conn"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/retry"
 )
 
 // dbConn holds a connection to a database and supports to reset the connection.
@@ -100,9 +99,7 @@ func (c *dbConn) execSQLs(ctx context.Context, queries ...string) error {
 }
 
 // execSQLs executes DDL queries.
-func (c *dbConn) execDDLs(queries ...string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), utils.DefaultDBTimeout)
-	defer cancel()
+func (c *dbConn) execDDLs(ctx context.Context, queries ...string) error {
 	return c.execSQLs(ctx, queries...)
 }
 

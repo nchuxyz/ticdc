@@ -25,12 +25,12 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/cdcpb"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/pkg/config"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/regionspan"
-	"github.com/pingcap/ticdc/pkg/util"
-	"github.com/pingcap/ticdc/pkg/workerpool"
+	"github.com/pingcap/tiflow/cdc/contextutil"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/pkg/config"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/regionspan"
+	"github.com/pingcap/tiflow/pkg/workerpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
@@ -154,42 +154,46 @@ type regionWorker struct {
 
 	metrics *regionWorkerMetrics
 
-	enableOldValue bool
-	storeAddr      string
+	storeAddr string
 }
 
 func newRegionWorker(s *eventFeedSession, addr string) *regionWorker {
-	cfg := config.GetGlobalServerConfig().KVClient
 	worker := &regionWorker{
-		session:        s,
-		inputCh:        make(chan *regionStatefulEvent, regionWorkerInputChanSize),
-		outputCh:       s.eventCh,
-		errorCh:        make(chan error, 1),
-		statesManager:  newRegionStateManager(-1),
-		rtsManager:     newRegionTsManager(),
-		rtsUpdateCh:    make(chan *regionTsInfo, 1024),
-		enableOldValue: s.enableOldValue,
-		storeAddr:      addr,
-		concurrent:     cfg.WorkerConcurrent,
+		session:       s,
+		inputCh:       make(chan *regionStatefulEvent, regionWorkerInputChanSize),
+		outputCh:      s.eventCh,
+		errorCh:       make(chan error, 1),
+		statesManager: newRegionStateManager(-1),
+		rtsManager:    newRegionTsManager(),
+		rtsUpdateCh:   make(chan *regionTsInfo, 1024),
+		storeAddr:     addr,
+		concurrent:    s.client.config.WorkerConcurrent,
 	}
 	return worker
 }
 
 func (w *regionWorker) initMetrics(ctx context.Context) {
-	captureAddr := util.CaptureAddrFromCtx(ctx)
-	changefeedID := util.ChangefeedIDFromCtx(ctx)
+	changefeedID := contextutil.ChangefeedIDFromCtx(ctx)
 
 	metrics := &regionWorkerMetrics{}
-	metrics.metricReceivedEventSize = eventSize.WithLabelValues(captureAddr, "received")
-	metrics.metricDroppedEventSize = eventSize.WithLabelValues(captureAddr, "dropped")
-	metrics.metricPullEventInitializedCounter = pullEventCounter.WithLabelValues(cdcpb.Event_INITIALIZED.String(), captureAddr, changefeedID)
-	metrics.metricPullEventCommittedCounter = pullEventCounter.WithLabelValues(cdcpb.Event_COMMITTED.String(), captureAddr, changefeedID)
-	metrics.metricPullEventCommitCounter = pullEventCounter.WithLabelValues(cdcpb.Event_COMMIT.String(), captureAddr, changefeedID)
-	metrics.metricPullEventPrewriteCounter = pullEventCounter.WithLabelValues(cdcpb.Event_PREWRITE.String(), captureAddr, changefeedID)
-	metrics.metricPullEventRollbackCounter = pullEventCounter.WithLabelValues(cdcpb.Event_ROLLBACK.String(), captureAddr, changefeedID)
-	metrics.metricSendEventResolvedCounter = sendEventCounter.WithLabelValues("native-resolved", captureAddr, changefeedID)
-	metrics.metricSendEventCommitCounter = sendEventCounter.WithLabelValues("commit", captureAddr, changefeedID)
-	metrics.metricSendEventCommittedCounter = sendEventCounter.WithLabelValues("committed", captureAddr, changefeedID)
+	metrics.metricReceivedEventSize = eventSize.WithLabelValues("received")
+	metrics.metricDroppedEventSize = eventSize.WithLabelValues("dropped")
+	metrics.metricPullEventInitializedCounter = pullEventCounter.
+		WithLabelValues(cdcpb.Event_INITIALIZED.String(), changefeedID.Namespace, changefeedID.ID)
+	metrics.metricPullEventCommittedCounter = pullEventCounter.
+		WithLabelValues(cdcpb.Event_COMMITTED.String(), changefeedID.Namespace, changefeedID.ID)
+	metrics.metricPullEventCommitCounter = pullEventCounter.
+		WithLabelValues(cdcpb.Event_COMMIT.String(), changefeedID.Namespace, changefeedID.ID)
+	metrics.metricPullEventPrewriteCounter = pullEventCounter.
+		WithLabelValues(cdcpb.Event_PREWRITE.String(), changefeedID.Namespace, changefeedID.ID)
+	metrics.metricPullEventRollbackCounter = pullEventCounter.
+		WithLabelValues(cdcpb.Event_ROLLBACK.String(), changefeedID.Namespace, changefeedID.ID)
+	metrics.metricSendEventResolvedCounter = sendEventCounter.
+		WithLabelValues("native-resolved", changefeedID.Namespace, changefeedID.ID)
+	metrics.metricSendEventCommitCounter = sendEventCounter.
+		WithLabelValues("commit", changefeedID.Namespace, changefeedID.ID)
+	metrics.metricSendEventCommittedCounter = sendEventCounter.
+		WithLabelValues("committed", changefeedID.Namespace, changefeedID.ID)
 
 	w.metrics = metrics
 }
@@ -235,17 +239,20 @@ func (w *regionWorker) checkShouldExit() error {
 	return nil
 }
 
-func (w *regionWorker) handleSingleRegionError(ctx context.Context, err error, state *regionFeedState) error {
+func (w *regionWorker) handleSingleRegionError(err error, state *regionFeedState) error {
 	if state.lastResolvedTs > state.sri.ts {
 		state.sri.ts = state.lastResolvedTs
 	}
 	regionID := state.sri.verID.GetID()
 	log.Info("single region event feed disconnected",
+		zap.String("namesapce", w.session.client.changefeed.Namespace),
+		zap.String("changefeed", w.session.client.changefeed.ID),
 		zap.Uint64("regionID", regionID),
 		zap.Uint64("requestID", state.requestID),
 		zap.Stringer("span", state.sri.span),
 		zap.Uint64("checkpoint", state.sri.ts),
-		zap.String("error", err.Error()))
+		zap.String("error", err.Error()),
+		zap.Any("sri", state.sri))
 	// if state is already marked stopped, it must have been or would be processed by `onRegionFail`
 	if state.isStopped() {
 		return w.checkShouldExit()
@@ -273,19 +280,16 @@ func (w *regionWorker) handleSingleRegionError(ctx context.Context, err error, s
 	}
 
 	revokeToken := !state.initialized
-	err2 := w.session.onRegionFail(ctx, regionErrorInfo{
-		singleRegionInfo: state.sri,
-		err:              err,
-	}, revokeToken)
-	if err2 != nil {
-		return err2
-	}
+	// since the context used in region worker will be cancelled after region
+	// worker exits, we must use the parent context to prevent regionErrorInfo loss.
+	errInfo := newRegionErrorInfo(state.sri, err)
+	w.session.onRegionFail(w.parentCtx, errInfo, revokeToken)
 
 	return retErr
 }
 
 func (w *regionWorker) resolveLock(ctx context.Context) error {
-	// tikv resolved update interval is 1s, use half of the resolck lock interval
+	// tikv resolved update interval is 1s, use half of the resolve lock interval
 	// as lock penalty.
 	resolveLockPenalty := 10
 	resolveLockInterval := 20 * time.Second
@@ -302,12 +306,14 @@ func (w *regionWorker) resolveLock(ctx context.Context) error {
 		case rtsUpdate := <-w.rtsUpdateCh:
 			w.rtsManager.Upsert(rtsUpdate)
 		case <-advanceCheckTicker.C:
-			version, err := w.session.kvStorage.GetCachedCurrentVersion()
+			currentTimeFromPD, err := w.session.client.pdClock.CurrentTime()
 			if err != nil {
-				log.Warn("failed to get current version from PD", zap.Error(err))
+				log.Warn("failed to get current version from PD",
+					zap.Error(err),
+					zap.String("namesapce", w.session.client.changefeed.Namespace),
+					zap.String("changefeed", w.session.client.changefeed.ID))
 				continue
 			}
-			currentTimeFromPD := oracle.GetTimeFromTS(version.Ver)
 			expired := make([]*regionTsInfo, 0)
 			for w.rtsManager.Len() > 0 {
 				item := w.rtsManager.Pop()
@@ -329,7 +335,7 @@ func (w *regionWorker) resolveLock(ctx context.Context) error {
 			for _, rts := range expired {
 				state, ok := w.getRegionState(rts.regionID)
 				if !ok || state.isStopped() {
-					// state is already deleted or stoppped, just continue,
+					// state is already deleted or stopped, just continue,
 					// and don't need to push resolved ts back to heap.
 					continue
 				}
@@ -340,10 +346,12 @@ func (w *regionWorker) resolveLock(ctx context.Context) error {
 					sinceLastEvent := time.Since(rts.ts.eventTime)
 					if sinceLastResolvedTs > reconnectInterval && sinceLastEvent > reconnectInterval {
 						log.Warn("kv client reconnect triggered",
-							zap.Duration("duration", sinceLastResolvedTs), zap.Duration("since last event", sinceLastResolvedTs))
+							zap.String("namesapce", w.session.client.changefeed.Namespace),
+							zap.String("changefeed", w.session.client.changefeed.ID),
+							zap.Duration("duration", sinceLastResolvedTs), zap.Duration("sinceLastEvent", sinceLastResolvedTs))
 						return errReconnect
 					}
-					// Only resolve lock if the resovled-ts keeps unchanged for
+					// Only resolve lock if the resolved-ts keeps unchanged for
 					// more than resolveLockPenalty times.
 					if rts.ts.penalty < resolveLockPenalty {
 						if lastResolvedTs > rts.ts.resolvedTs {
@@ -355,6 +363,9 @@ func (w *regionWorker) resolveLock(ctx context.Context) error {
 						continue
 					}
 					log.Warn("region not receiving resolved event from tikv or resolved ts is not pushing for too long time, try to resolve lock",
+						zap.String("namesapce", w.session.client.changefeed.Namespace),
+						zap.String("changefeed", w.session.client.changefeed.ID),
+						zap.String("addr", w.storeAddr),
 						zap.Uint64("regionID", rts.regionID),
 						zap.Stringer("span", state.getRegionSpan()),
 						zap.Duration("duration", sinceLastResolvedTs),
@@ -363,7 +374,10 @@ func (w *regionWorker) resolveLock(ctx context.Context) error {
 					)
 					err = w.session.lockResolver.Resolve(ctx, rts.regionID, maxVersion)
 					if err != nil {
-						log.Warn("failed to resolve lock", zap.Uint64("regionID", rts.regionID), zap.Error(err))
+						log.Warn("failed to resolve lock",
+							zap.Uint64("regionID", rts.regionID), zap.Error(err),
+							zap.String("namesapce", w.session.client.changefeed.Namespace),
+							zap.String("changefeed", w.session.client.changefeed.ID))
 						continue
 					}
 					rts.ts.penalty = 0
@@ -388,26 +402,28 @@ func (w *regionWorker) processEvent(ctx context.Context, event *regionStatefulEv
 		case *cdcpb.Event_Entries_:
 			err = w.handleEventEntry(ctx, x, event.state)
 			if err != nil {
-				err = w.handleSingleRegionError(ctx, err, event.state)
+				err = w.handleSingleRegionError(err, event.state)
 			}
 		case *cdcpb.Event_Admin_:
-			log.Info("receive admin event", zap.Stringer("event", event.changeEvent))
+			log.Info("receive admin event",
+				zap.Stringer("event", event.changeEvent),
+				zap.String("namesapce", w.session.client.changefeed.Namespace),
+				zap.String("changefeed", w.session.client.changefeed.ID))
 		case *cdcpb.Event_Error:
 			err = w.handleSingleRegionError(
-				ctx,
 				cerror.WrapError(cerror.ErrEventFeedEventError, &eventError{err: x.Error}),
 				event.state,
 			)
 		case *cdcpb.Event_ResolvedTs:
 			if err = w.handleResolvedTs(ctx, x.ResolvedTs, event.state); err != nil {
-				err = w.handleSingleRegionError(ctx, err, event.state)
+				err = w.handleSingleRegionError(err, event.state)
 			}
 		}
 	}
 
 	if event.resolvedTs != nil {
 		if err = w.handleResolvedTs(ctx, event.resolvedTs.Ts, event.state); err != nil {
-			err = w.handleSingleRegionError(ctx, err, event.state)
+			err = w.handleSingleRegionError(err, event.state)
 		}
 	}
 	event.state.lock.Unlock()
@@ -443,7 +459,9 @@ func (w *regionWorker) eventHandler(ctx context.Context) error {
 		// event == nil means the region worker should exit and re-establish
 		// all existing regions.
 		if !ok || event == nil {
-			log.Info("region worker closed by error")
+			log.Info("region worker closed by error",
+				zap.String("namesapce", w.session.client.changefeed.Namespace),
+				zap.String("changefeed", w.session.client.changefeed.ID))
 			exitEventHandler = true
 			return
 		}
@@ -509,7 +527,7 @@ func (w *regionWorker) eventHandler(ctx context.Context) error {
 			// Principle: events from the same region must be processed linearly.
 			//
 			// When buffered events exceed high watermark, we start to use worker
-			// pool to improve throughtput, and we need a mechanism to quit worker
+			// pool to improve throughput, and we need a mechanism to quit worker
 			// pool when buffered events are less than low watermark, which means
 			// we should have a way to know whether events sent to the worker pool
 			// are all processed.
@@ -584,7 +602,10 @@ func (w *regionWorker) cancelStream(delay time.Duration) {
 		// to avoid too frequent region rebuilt.
 		time.Sleep(delay)
 	} else {
-		log.Warn("gRPC stream cancel func not found", zap.String("addr", w.storeAddr))
+		log.Warn("gRPC stream cancel func not found",
+			zap.String("addr", w.storeAddr),
+			zap.String("namesapce", w.session.client.changefeed.Namespace),
+			zap.String("changefeed", w.session.client.changefeed.ID))
 	}
 }
 
@@ -595,25 +616,36 @@ func (w *regionWorker) run(parentCtx context.Context) error {
 		}
 	}()
 	w.parentCtx = parentCtx
-	wg, ctx := errgroup.WithContext(parentCtx)
+	ctx, cancel := context.WithCancel(parentCtx)
+	wg, ctx := errgroup.WithContext(ctx)
 	w.initMetrics(ctx)
 	w.initPoolHandles(w.concurrent)
+
+	var retErr error
+	once := sync.Once{}
+	handleError := func(err error) error {
+		if err != nil {
+			once.Do(func() {
+				cancel()
+				retErr = err
+			})
+		}
+		return err
+	}
 	wg.Go(func() error {
-		return w.checkErrorReconnect(w.resolveLock(ctx))
+		return handleError(w.checkErrorReconnect(w.resolveLock(ctx)))
 	})
 	wg.Go(func() error {
-		return w.eventHandler(ctx)
+		return handleError(w.eventHandler(ctx))
 	})
-	wg.Go(func() error {
-		return w.collectWorkpoolError(ctx)
-	})
-	err := wg.Wait()
+	_ = handleError(w.collectWorkpoolError(ctx))
+	_ = wg.Wait()
 	// ErrRegionWorkerExit means the region worker exits normally, but we don't
 	// need to terminate the other goroutines in errgroup
-	if cerror.ErrRegionWorkerExit.Equal(err) {
+	if cerror.ErrRegionWorkerExit.Equal(retErr) {
 		return nil
 	}
-	return err
+	return retErr
 }
 
 func (w *regionWorker) handleEventEntry(
@@ -637,7 +669,9 @@ func (w *regionWorker) handleEventEntry(
 		case cdcpb.Event_INITIALIZED:
 			if time.Since(state.startFeedTime) > 20*time.Second {
 				log.Warn("The time cost of initializing is too much",
-					zap.Duration("timeCost", time.Since(state.startFeedTime)),
+					zap.String("namesapce", w.session.client.changefeed.Namespace),
+					zap.String("changefeed", w.session.client.changefeed.ID),
+					zap.Duration("duration", time.Since(state.startFeedTime)),
 					zap.Uint64("regionID", regionID))
 			}
 			w.metrics.metricPullEventInitializedCounter.Inc()
@@ -646,7 +680,7 @@ func (w *regionWorker) handleEventEntry(
 			w.session.regionRouter.Release(state.sri.rpcCtx.Addr)
 			cachedEvents := state.matcher.matchCachedRow()
 			for _, cachedEvent := range cachedEvents {
-				revent, err := assembleRowEvent(regionID, cachedEvent, w.enableOldValue)
+				revent, err := assembleRowEvent(regionID, cachedEvent)
 				if err != nil {
 					return errors.Trace(err)
 				}
@@ -659,14 +693,14 @@ func (w *regionWorker) handleEventEntry(
 			}
 		case cdcpb.Event_COMMITTED:
 			w.metrics.metricPullEventCommittedCounter.Inc()
-			revent, err := assembleRowEvent(regionID, entry, w.enableOldValue)
+			revent, err := assembleRowEvent(regionID, entry)
 			if err != nil {
 				return errors.Trace(err)
 			}
 
 			if entry.CommitTs <= state.lastResolvedTs {
 				logPanic("The CommitTs must be greater than the resolvedTs",
-					zap.String("Event Type", "COMMITTED"),
+					zap.String("EventType", "COMMITTED"),
 					zap.Uint64("CommitTs", entry.CommitTs),
 					zap.Uint64("resolvedTs", state.lastResolvedTs),
 					zap.Uint64("regionID", regionID))
@@ -685,7 +719,7 @@ func (w *regionWorker) handleEventEntry(
 			w.metrics.metricPullEventCommitCounter.Inc()
 			if entry.CommitTs <= state.lastResolvedTs {
 				logPanic("The CommitTs must be greater than the resolvedTs",
-					zap.String("Event Type", "COMMIT"),
+					zap.String("EventType", "COMMIT"),
 					zap.Uint64("CommitTs", entry.CommitTs),
 					zap.Uint64("resolvedTs", state.lastResolvedTs),
 					zap.Uint64("regionID", regionID))
@@ -703,7 +737,7 @@ func (w *regionWorker) handleEventEntry(
 					entry.GetType(), entry.GetOpType())
 			}
 
-			revent, err := assembleRowEvent(regionID, entry, w.enableOldValue)
+			revent, err := assembleRowEvent(regionID, entry)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -731,7 +765,7 @@ func (w *regionWorker) handleResolvedTs(
 		return nil
 	}
 	regionID := state.sri.verID.GetID()
-	// Send resolved ts update in non blocking way, since we can re-query real
+	// Send resolved ts update in non-blocking way, since we can re-query real
 	// resolved ts from region state even if resolved ts update is discarded.
 	// NOTICE: We send any regionTsInfo to resolveLock thread to give us a chance to trigger resolveLock logic
 	// (1) if it is a fallback resolvedTs event, it will be discarded and accumulate penalty on the progress;
@@ -743,7 +777,9 @@ func (w *regionWorker) handleResolvedTs(
 
 	if resolvedTs < state.lastResolvedTs {
 		log.Warn("The resolvedTs is fallen back in kvclient",
-			zap.String("Event Type", "RESOLVED"),
+			zap.String("namesapce", w.session.client.changefeed.Namespace),
+			zap.String("changefeed", w.session.client.changefeed.ID),
+			zap.String("EventType", "RESOLVED"),
 			zap.Uint64("resolvedTs", resolvedTs),
 			zap.Uint64("lastResolvedTs", state.lastResolvedTs),
 			zap.Uint64("regionID", regionID))
@@ -770,8 +806,7 @@ func (w *regionWorker) handleResolvedTs(
 
 // evictAllRegions is used when gRPC stream meets error and re-establish, notify
 // all existing regions to re-establish
-func (w *regionWorker) evictAllRegions() error {
-	var err error
+func (w *regionWorker) evictAllRegions() {
 	for _, states := range w.statesManager.states {
 		states.Range(func(_, value interface{}) bool {
 			state := value.(*regionFeedState)
@@ -783,23 +818,19 @@ func (w *regionWorker) evictAllRegions() error {
 			}
 			state.markStopped()
 			w.delRegionState(state.sri.verID.GetID())
-			singleRegionInfo := state.sri.partialClone()
-			if state.lastResolvedTs > singleRegionInfo.ts {
-				singleRegionInfo.ts = state.lastResolvedTs
+			if state.lastResolvedTs > state.sri.ts {
+				state.sri.ts = state.lastResolvedTs
 			}
 			revokeToken := !state.initialized
 			state.lock.Unlock()
 			// since the context used in region worker will be cancelled after
 			// region worker exits, we must use the parent context to prevent
 			// regionErrorInfo loss.
-			err = w.session.onRegionFail(w.parentCtx, regionErrorInfo{
-				singleRegionInfo: singleRegionInfo,
-				err:              cerror.ErrEventFeedAborted.FastGenByArgs(),
-			}, revokeToken)
-			return err == nil
+			errInfo := newRegionErrorInfo(state.sri, cerror.ErrEventFeedAborted.FastGenByArgs())
+			w.session.onRegionFail(w.parentCtx, errInfo, revokeToken)
+			return true
 		})
 	}
-	return err
 }
 
 func getWorkerPoolSize() (size int) {

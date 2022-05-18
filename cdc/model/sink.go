@@ -17,11 +17,13 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"unsafe"
 
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/pkg/quotes"
-	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/util/rowcodec"
+	"github.com/pingcap/tiflow/pkg/quotes"
+	"github.com/pingcap/tiflow/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -252,7 +254,8 @@ type RowChangedEvent struct {
 
 	RowID int64 `json:"row-id" msg:"-"` // Deprecated. It is empty when the RowID comes from clustered index table.
 
-	Table *TableName `json:"table" msg:"table"`
+	Table    *TableName         `json:"table" msg:"table"`
+	ColInfos []rowcodec.ColInfo `json:"column-infos" msg:"-"`
 
 	TableInfoVersion uint64 `json:"table-info-version,omitempty" msg:"table-info-version"`
 
@@ -261,13 +264,27 @@ type RowChangedEvent struct {
 	PreColumns   []*Column `json:"pre-columns" msg:"-"`
 	IndexColumns [][]int   `json:"-" msg:"index-columns"`
 
-	// approximate size of this event, calculate by tikv proto bytes size
-	ApproximateSize int64 `json:"-" msg:"-"`
+	// ApproximateDataSize is the approximate size of protobuf binary
+	// representation of this event.
+	ApproximateDataSize int64 `json:"-" msg:"-"`
+
+	// SplitTxn marks this RowChangedEvent as the first line of a new txn.
+	SplitTxn bool `json:"-" msg:"-"`
 }
 
 // IsDelete returns true if the row is a delete event
 func (r *RowChangedEvent) IsDelete() bool {
 	return len(r.PreColumns) != 0 && len(r.Columns) == 0
+}
+
+// IsInsert returns true if the row is an insert event
+func (r *RowChangedEvent) IsInsert() bool {
+	return len(r.PreColumns) == 0 && len(r.Columns) != 0
+}
+
+// IsUpdate returns true if the row is an update event
+func (r *RowChangedEvent) IsUpdate() bool {
+	return len(r.PreColumns) != 0 && len(r.Columns) != 0
 }
 
 // PrimaryKeyColumns returns the column(s) corresponding to the handle key(s)
@@ -309,19 +326,91 @@ func (r *RowChangedEvent) HandleKeyColumns() []*Column {
 	}
 
 	if len(pkeyCols) == 0 {
-		// TODO redact the message
-		log.Panic("Cannot find handle key columns, bug?", zap.Reflect("event", r))
+		log.Panic("Cannot find handle key columns.", zap.Any("event", r))
 	}
 
 	return pkeyCols
 }
 
+// PrimaryKeyColInfos returns the column(s) and colInfo(s) corresponding to the primary key(s)
+func (r *RowChangedEvent) PrimaryKeyColInfos() ([]*Column, []rowcodec.ColInfo) {
+	pkeyCols := make([]*Column, 0)
+	pkeyColInfos := make([]rowcodec.ColInfo, 0)
+
+	var cols []*Column
+	if r.IsDelete() {
+		cols = r.PreColumns
+	} else {
+		cols = r.Columns
+	}
+
+	for i, col := range cols {
+		if col != nil && col.Flag.IsPrimaryKey() {
+			pkeyCols = append(pkeyCols, col)
+			pkeyColInfos = append(pkeyColInfos, r.ColInfos[i])
+		}
+	}
+
+	// It is okay not to have primary keys, so the empty array is an acceptable result
+	return pkeyCols, pkeyColInfos
+}
+
+// WithHandlePrimaryFlag set `HandleKeyFlag` and `PrimaryKeyFlag`
+func (r *RowChangedEvent) WithHandlePrimaryFlag(colNames map[string]struct{}) {
+	for _, col := range r.Columns {
+		if _, ok := colNames[col.Name]; ok {
+			col.Flag.SetIsHandleKey()
+			col.Flag.SetIsPrimaryKey()
+		}
+	}
+	for _, col := range r.PreColumns {
+		if _, ok := colNames[col.Name]; ok {
+			col.Flag.SetIsHandleKey()
+			col.Flag.SetIsPrimaryKey()
+		}
+	}
+}
+
+// ApproximateBytes returns approximate bytes in memory consumed by the event.
+func (r *RowChangedEvent) ApproximateBytes() int {
+	const sizeOfRowEvent = int(unsafe.Sizeof(*r))
+	const sizeOfTable = int(unsafe.Sizeof(*r.Table))
+	const sizeOfIndexes = int(unsafe.Sizeof(r.IndexColumns[0]))
+	const sizeOfInt = int(unsafe.Sizeof(int(0)))
+
+	// Size of table name
+	size := len(r.Table.Schema) + len(r.Table.Table) + sizeOfTable
+	// Size of cols
+	for i := range r.Columns {
+		size += r.Columns[i].ApproximateBytes
+	}
+	// Size of pre cols
+	for i := range r.PreColumns {
+		if r.PreColumns[i] != nil {
+			size += r.PreColumns[i].ApproximateBytes
+		}
+	}
+	// Size of index columns
+	for i := range r.IndexColumns {
+		size += len(r.IndexColumns[i]) * sizeOfInt
+		size += sizeOfIndexes
+	}
+	// Size of an empty row event
+	size += sizeOfRowEvent
+	return size
+}
+
 // Column represents a column value in row changed event
 type Column struct {
-	Name  string         `json:"name" msg:"name"`
-	Type  byte           `json:"type" msg:"type"`
-	Flag  ColumnFlagType `json:"flag" msg:"-"`
-	Value interface{}    `json:"value" msg:"value"`
+	Name    string         `json:"name" msg:"name"`
+	Type    byte           `json:"type" msg:"type"`
+	Charset string         `json:"charset" msg:"charset"`
+	Flag    ColumnFlagType `json:"flag" msg:"-"`
+	Value   interface{}    `json:"value" msg:"value"`
+	Default interface{}    `json:"default" msg:"-"`
+
+	// ApproximateBytes is approximate bytes consumed by the column.
+	ApproximateBytes int `json:"-"`
 }
 
 // RedoColumn stores Column change
@@ -405,6 +494,7 @@ type DDLEvent struct {
 	PreTableInfo *SimpleTableInfo `msg:"pre-table-info"`
 	Query        string           `msg:"query"`
 	Type         model.ActionType `msg:"-"`
+	Done         bool             `msg:"-"`
 }
 
 // RedoDDLEvent represents DDL event used in redo log persistent
@@ -415,29 +505,83 @@ type RedoDDLEvent struct {
 
 // FromJob fills the values of DDLEvent from DDL job
 func (d *DDLEvent) FromJob(job *model.Job, preTableInfo *TableInfo) {
-	d.TableInfo = new(SimpleTableInfo)
-	d.TableInfo.Schema = job.SchemaName
+	// populating DDLEvent of a rename tables job is handled in `FromRenameTablesJob()`
+	if d.Type == model.ActionRenameTables {
+		return
+	}
+
+	// The query for "DROP TABLE" and "DROP VIEW" statements need
+	// to be rebuilt. The reason is elaborated as follows:
+	// for a DDL statement like "DROP TABLE test1.table1, test2.table2",
+	// two DDL jobs will be generated. These two jobs can be differentiated
+	// from job.BinlogInfo.TableInfo whereas the job.Query are identical.
+	rebuildQuery := func() {
+		switch d.Type {
+		case model.ActionDropTable:
+			d.Query = fmt.Sprintf("DROP TABLE `%s`.`%s`", d.TableInfo.Schema, d.TableInfo.Table)
+		case model.ActionDropView:
+			d.Query = fmt.Sprintf("DROP VIEW `%s`.`%s`", d.TableInfo.Schema, d.TableInfo.Table)
+		default:
+			d.Query = job.Query
+		}
+	}
+
 	d.StartTs = job.StartTS
 	d.CommitTs = job.BinlogInfo.FinishedTS
-	d.Query = job.Query
 	d.Type = job.Type
-
-	if job.BinlogInfo.TableInfo != nil {
-		tableName := job.BinlogInfo.TableInfo.Name.O
-		tableInfo := job.BinlogInfo.TableInfo
-		d.TableInfo.ColumnInfo = make([]*ColumnInfo, len(tableInfo.Columns))
-
-		for i, colInfo := range tableInfo.Columns {
-			d.TableInfo.ColumnInfo[i] = new(ColumnInfo)
-			d.TableInfo.ColumnInfo[i].FromTiColumnInfo(colInfo)
-		}
-
-		d.TableInfo.Table = tableName
-		d.TableInfo.TableID = job.TableID
-	}
+	// fill PreTableInfo for the event.
 	d.fillPreTableInfo(preTableInfo)
+	// fill TableInfo for the event.
+	d.fillTableInfo(job.BinlogInfo.TableInfo, job.SchemaName)
+	// rebuild the query if necessary
+	rebuildQuery()
 }
 
+// FromRenameTablesJob fills the values of DDLEvent from a rename tables DDL job
+func (d *DDLEvent) FromRenameTablesJob(job *model.Job,
+	oldSchemaName, newSchemaName string,
+	preTableInfo *TableInfo, tableInfo *model.TableInfo,
+) {
+	if job.Type != model.ActionRenameTables {
+		return
+	}
+
+	d.StartTs = job.StartTS
+	d.CommitTs = job.BinlogInfo.FinishedTS
+	oldTableName := preTableInfo.Name.O
+	newTableName := tableInfo.Name.O
+	d.Query = fmt.Sprintf("RENAME TABLE `%s`.`%s` TO `%s`.`%s`",
+		oldSchemaName, oldTableName, newSchemaName, newTableName)
+	d.Type = model.ActionRenameTable
+	// fill PreTableInfo for the event.
+	d.fillPreTableInfo(preTableInfo)
+	// fill TableInfo for the event.
+	d.fillTableInfo(tableInfo, newSchemaName)
+}
+
+// fillTableInfo populates the TableInfo of an DDLEvent
+func (d *DDLEvent) fillTableInfo(tableInfo *model.TableInfo,
+	schemaName string,
+) {
+	// `TableInfo` field of `DDLEvent` should always not be nil
+	d.TableInfo = new(SimpleTableInfo)
+	d.TableInfo.Schema = schemaName
+
+	if tableInfo == nil {
+		return
+	}
+
+	d.TableInfo.ColumnInfo = make([]*ColumnInfo, len(tableInfo.Columns))
+	for i, colInfo := range tableInfo.Columns {
+		d.TableInfo.ColumnInfo[i] = new(ColumnInfo)
+		d.TableInfo.ColumnInfo[i].FromTiColumnInfo(colInfo)
+	}
+
+	d.TableInfo.Table = tableInfo.Name.O
+	d.TableInfo.TableID = tableInfo.ID
+}
+
+// fillPreTableInfo populates the PreTableInfo of an event
 func (d *DDLEvent) fillPreTableInfo(preTableInfo *TableInfo) {
 	if preTableInfo == nil {
 		return
@@ -474,9 +618,9 @@ type SingleTableTxn struct {
 func (t *SingleTableTxn) Append(row *RowChangedEvent) {
 	if row.StartTs != t.StartTs || row.CommitTs != t.CommitTs || row.Table.TableID != t.Table.TableID {
 		log.Panic("unexpected row change event",
-			zap.Uint64("startTs of txn", t.StartTs),
-			zap.Uint64("commitTs of txn", t.CommitTs),
-			zap.Any("table of txn", t.Table),
+			zap.Uint64("startTs", t.StartTs),
+			zap.Uint64("commitTs", t.CommitTs),
+			zap.Any("table", t.Table),
 			zap.Any("row", row))
 	}
 	t.Rows = append(t.Rows, row)

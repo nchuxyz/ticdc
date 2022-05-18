@@ -18,6 +18,11 @@ func LoaderCheckpoint(task string) string {
 	return task + "_loader_checkpoint"
 }
 
+// LightningCheckpoint returns lightning's checkpoint table name.
+func LightningCheckpoint(task string) string {
+	return task + "_lightning_checkpoint_list"
+}
+
 // SyncerCheckpoint returns syncer's checkpoint table name.
 func SyncerCheckpoint(task string) string {
 	return task + "_syncer_checkpoint"
@@ -31,4 +36,20 @@ func SyncerShardMeta(task string) string {
 // SyncerOnlineDDL returns syncer's onlineddl checkpoint table name.
 func SyncerOnlineDDL(task string) string {
 	return task + "_onlineddl"
+}
+
+func ValidatorCheckpoint(task string) string {
+	return task + "_validator_checkpoint"
+}
+
+func ValidatorPendingChange(task string) string {
+	return task + "_validator_pending_change"
+}
+
+func ValidatorErrorChange(task string) string {
+	return task + "_validator_error_change"
+}
+
+func ValidatorTableStatus(task string) string {
+	return task + "_validator_table_status"
 }

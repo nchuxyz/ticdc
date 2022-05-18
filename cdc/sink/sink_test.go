@@ -17,14 +17,12 @@ import (
 	"context"
 	"testing"
 
-	"github.com/pingcap/ticdc/pkg/config"
-	"github.com/pingcap/ticdc/pkg/util/testleak"
+	"github.com/pingcap/tiflow/pkg/config"
 	"github.com/stretchr/testify/require"
 )
 
 func TestValidateSink(t *testing.T) {
-	defer testleak.AfterTestT(t)()
-
+	t.Parallel()
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -35,7 +33,7 @@ func TestValidateSink(t *testing.T) {
 	sinkURI := "mysql://root:111@127.0.0.1:3306/"
 	err := Validate(ctx, sinkURI, replicateConfig, opts)
 	require.NotNil(t, err)
-	require.Regexp(t, "fail to open MySQL connection.*ErrMySQLConnectionError.*", err)
+	require.Contains(t, err.Error(), "fail to open MySQL connection")
 
 	// test sink uri right
 	sinkURI = "blackhole://"

@@ -18,14 +18,16 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/util/filter"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/dm/pb"
-	"github.com/pingcap/ticdc/dm/pkg/binlog"
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/syncer/shardddl"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/dm/pb"
+	"github.com/pingcap/tiflow/dm/pkg/binlog"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/syncer/shardddl"
 )
 
 var _ = Suite(&statusSuite{})
@@ -40,6 +42,7 @@ func (t *statusSuite) TestStatusRace(c *C) {
 	s.cfg = &config.SubTaskConfig{}
 	s.checkpoint = &mockCheckpoint{}
 	s.pessimist = shardddl.NewPessimist(&l, nil, "", "")
+	s.optimist = shardddl.NewOptimist(&l, nil, "", "")
 
 	sourceStatus := &binlog.SourceStatus{
 		Location: binlog.Location{
@@ -77,3 +80,5 @@ func (*mockCheckpoint) FlushedGlobalPoint() binlog.Location {
 		},
 	}
 }
+
+func (*mockCheckpoint) SaveTablePoint(_ *filter.Table, _ binlog.Location, _ *model.TableInfo) {}

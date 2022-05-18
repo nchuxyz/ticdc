@@ -13,40 +13,36 @@
 
 package message
 
-import (
-	"github.com/pingcap/ticdc/cdc/model"
-)
-
 // Type is the type of Message
 type Type int
 
 // types of Message
 const (
 	TypeUnknown Type = iota
-	TypeTick
-	TypeBarrier
-	// Add a new type when adding a new message.
+	TypeStop
+	TypeValue
 )
 
 // Message is a vehicle for transferring information between nodes
-type Message struct {
+type Message[T any] struct {
 	// Tp is the type of Message
 	Tp Type
-	// BarrierTs
-	BarrierTs model.Ts
+
+	Value T
 }
 
-// TickMessage creates the message of Tick
-func TickMessage() Message {
-	return Message{
-		Tp: TypeTick,
+// StopMessage creates the message of Stop.
+// After receiving a Stop message, actor will be closed.
+func StopMessage[T any]() Message[T] {
+	return Message[T]{
+		Tp: TypeStop,
 	}
 }
 
-// BarrierMessage creates the message of Command
-func BarrierMessage(barrierTs model.Ts) Message {
-	return Message{
-		Tp:        TypeBarrier,
-		BarrierTs: barrierTs,
+// ValueMessage creates the message of Value.
+func ValueMessage[T any](val T) Message[T] {
+	return Message[T]{
+		Tp:    TypeValue,
+		Value: val,
 	}
 }

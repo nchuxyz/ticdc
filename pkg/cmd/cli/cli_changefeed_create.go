@@ -23,31 +23,26 @@ import (
 	"github.com/google/uuid"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/cdc/sink"
-	cmdcontext "github.com/pingcap/ticdc/pkg/cmd/context"
-	"github.com/pingcap/ticdc/pkg/cmd/factory"
-	"github.com/pingcap/ticdc/pkg/cmd/util"
-	"github.com/pingcap/ticdc/pkg/config"
-	"github.com/pingcap/ticdc/pkg/cyclic"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/etcd"
-	"github.com/pingcap/ticdc/pkg/filter"
-	"github.com/pingcap/ticdc/pkg/security"
-	"github.com/pingcap/ticdc/pkg/txnutil/gc"
-	ticdcutil "github.com/pingcap/ticdc/pkg/util"
-	"github.com/pingcap/ticdc/pkg/version"
+	"github.com/pingcap/tiflow/cdc/contextutil"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/sink"
+	cmdcontext "github.com/pingcap/tiflow/pkg/cmd/context"
+	"github.com/pingcap/tiflow/pkg/cmd/factory"
+	"github.com/pingcap/tiflow/pkg/cmd/util"
+	"github.com/pingcap/tiflow/pkg/config"
+	"github.com/pingcap/tiflow/pkg/cyclic"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/etcd"
+	"github.com/pingcap/tiflow/pkg/filter"
+	"github.com/pingcap/tiflow/pkg/security"
+	"github.com/pingcap/tiflow/pkg/txnutil/gc"
+	ticdcutil "github.com/pingcap/tiflow/pkg/util"
+	"github.com/pingcap/tiflow/pkg/version"
 	"github.com/spf13/cobra"
 	"github.com/tikv/client-go/v2/oracle"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
 )
-
-// forceEnableOldValueProtocols specifies which protocols need to be forced to enable old value.
-var forceEnableOldValueProtocols = []string{
-	"canal",
-	"maxwell",
-}
 
 // changefeedCommonOptions defines common changefeed flags.
 type changefeedCommonOptions struct {
@@ -118,6 +113,7 @@ type createChangefeedOptions struct {
 	disableGCSafePointCheck bool
 	startTs                 uint64
 	timezone                string
+	schemaRegistry          string
 
 	cfg *config.ReplicaConfig
 }
@@ -141,6 +137,8 @@ func (o *createChangefeedOptions) addFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().BoolVarP(&o.disableGCSafePointCheck, "disable-gc-check", "", false, "Disable GC safe point check")
 	cmd.PersistentFlags().Uint64Var(&o.startTs, "start-ts", 0, "Start ts of changefeed")
 	cmd.PersistentFlags().StringVar(&o.timezone, "tz", "SYSTEM", "timezone used when checking sink uri (changefeed timezone is determined by cdc server)")
+	cmd.PersistentFlags().
+		StringVar(&o.schemaRegistry, "schema-registry", "", "Avro Schema Registry URI")
 }
 
 // complete adapts from the command line args to the data and client required.
@@ -169,18 +167,19 @@ func (o *createChangefeedOptions) complete(ctx context.Context, f factory.Factor
 		}
 		o.startTs = oracle.ComposeTS(ts, logical)
 	}
-
-	return o.completeCfg(ctx, cmd)
-}
-
-// completeCfg complete the replica config from file and cmd flags.
-func (o *createChangefeedOptions) completeCfg(ctx context.Context, cmd *cobra.Command) error {
 	_, captureInfos, err := o.etcdClient.GetCaptures(ctx)
 	if err != nil {
 		return err
 	}
 
-	cdcClusterVer, err := version.GetTiCDCClusterVersion(captureInfos)
+	return o.completeCfg(cmd, captureInfos)
+}
+
+// completeCfg complete the replica config from file and cmd flags.
+func (o *createChangefeedOptions) completeCfg(
+	cmd *cobra.Command, captureInfos []*model.CaptureInfo,
+) error {
+	cdcClusterVer, err := version.GetTiCDCClusterVersion(model.ListVersionsFromCaptureInfos(captureInfos))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -204,10 +203,13 @@ func (o *createChangefeedOptions) completeCfg(ctx context.Context, cmd *cobra.Co
 			return cerror.WrapError(cerror.ErrSinkURIInvalid, err)
 		}
 
-		protocol := sinkURIParsed.Query().Get("protocol")
-		for _, fp := range forceEnableOldValueProtocols {
-			if protocol == fp {
-				log.Warn("Attempting to replicate without old value enabled. CDC will enable old value and continue.", zap.String("protocol", protocol))
+		protocol := sinkURIParsed.Query().Get(config.ProtocolKey)
+		if protocol != "" {
+			cfg.Sink.Protocol = protocol
+		}
+		for _, fp := range config.ForceEnableOldValueProtocols {
+			if cfg.Sink.Protocol == fp {
+				log.Warn("Attempting to replicate without old value enabled. CDC will enable old value and continue.", zap.String("protocol", cfg.Sink.Protocol))
 				cfg.EnableOldValue = true
 				break
 			}
@@ -220,7 +222,7 @@ func (o *createChangefeedOptions) completeCfg(ctx context.Context, cmd *cobra.Co
 	}
 
 	for _, rules := range cfg.Sink.DispatchRules {
-		switch strings.ToLower(rules.Dispatcher) {
+		switch strings.ToLower(rules.PartitionRule) {
 		case "rowid", "index-value":
 			if cfg.EnableOldValue {
 				cmd.Printf("[WARN] This index-value distribution mode "+
@@ -228,6 +230,16 @@ func (o *createChangefeedOptions) completeCfg(ctx context.Context, cmd *cobra.Co
 					"switching on the old value, so please use caution! dispatch-rules: %#v", rules)
 			}
 		}
+	}
+
+	switch o.commonChangefeedOptions.sortEngine {
+	case model.SortInMemory:
+	case model.SortInFile:
+	case model.SortUnified:
+	default:
+		log.Warn("invalid sort-engine, use Unified Sorter by default",
+			zap.String("invalidSortEngine", o.commonChangefeedOptions.sortEngine))
+		o.commonChangefeedOptions.sortEngine = model.SortUnified
 	}
 
 	if o.commonChangefeedOptions.sortEngine == model.SortUnified && !cdcClusterVer.ShouldEnableUnifiedSorterByDefault() {
@@ -259,7 +271,7 @@ func (o *createChangefeedOptions) completeCfg(ctx context.Context, cmd *cobra.Co
 			// TODO(neil) enable ID bucket.
 		}
 	}
-
+	cfg.SchemaRegistry = o.schemaRegistry
 	// Complete cfg.
 	o.cfg = cfg
 
@@ -270,6 +282,11 @@ func (o *createChangefeedOptions) completeCfg(ctx context.Context, cmd *cobra.Co
 func (o *createChangefeedOptions) validate(ctx context.Context, cmd *cobra.Command) error {
 	if o.commonChangefeedOptions.sinkURI == "" {
 		return errors.New("Creating changefeed without a sink-uri")
+	}
+
+	err := o.cfg.Validate()
+	if err != nil {
+		return err
 	}
 
 	if err := o.validateStartTs(ctx); err != nil {
@@ -351,7 +368,7 @@ func (o *createChangefeedOptions) validateStartTs(ctx context.Context) error {
 	// Ensure the start ts is validate in the next 1 hour.
 	const ensureTTL = 60 * 60.
 	return gc.EnsureChangefeedStartTsSafety(
-		ctx, o.pdClient, o.changefeedID, ensureTTL, o.startTs)
+		ctx, o.pdClient, model.DefaultChangeFeedID(o.changefeedID), ensureTTL, o.startTs)
 }
 
 // validateTargetTs checks if targetTs is a valid value.
@@ -420,7 +437,7 @@ func (o *createChangefeedOptions) run(ctx context.Context, cmd *cobra.Command) e
 		return errors.Annotate(err, "can not load timezone, Please specify the time zone through environment variable `TZ` or command line parameters `--tz`")
 	}
 
-	ctx = ticdcutil.PutTimezoneInCtx(ctx, tz)
+	ctx = contextutil.PutTimezoneInCtx(ctx, tz)
 	err = o.validateSink(ctx, info.Config, info.Opts)
 	if err != nil {
 		return err
@@ -431,7 +448,8 @@ func (o *createChangefeedOptions) run(ctx context.Context, cmd *cobra.Command) e
 		return err
 	}
 
-	err = o.etcdClient.CreateChangefeedInfo(ctx, info, id)
+	err = o.etcdClient.CreateChangefeedInfo(ctx, info,
+		model.DefaultChangeFeedID(id))
 	if err != nil {
 		return err
 	}

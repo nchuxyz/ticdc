@@ -25,17 +25,12 @@ import (
 	. "github.com/pingcap/check"
 	filter "github.com/pingcap/tidb-tools/pkg/binlog-filter"
 
-	"github.com/pingcap/ticdc/dm/dm/config"
-	"github.com/pingcap/ticdc/dm/dm/pb"
-	"github.com/pingcap/ticdc/dm/dm/pbmock"
-	tcontext "github.com/pingcap/ticdc/dm/pkg/context"
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
-)
-
-const (
-	// do not forget to update this path if the file removed/renamed.
-	subTaskSampleFile = "../worker/subtask.toml"
+	"github.com/pingcap/tiflow/dm/dm/config"
+	"github.com/pingcap/tiflow/dm/dm/pb"
+	"github.com/pingcap/tiflow/dm/dm/pbmock"
+	tcontext "github.com/pingcap/tiflow/dm/pkg/context"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
 )
 
 func (t *testMaster) TestCollectSourceConfigFilesV1Import(c *C) {
@@ -67,7 +62,7 @@ func (t *testMaster) TestCollectSourceConfigFilesV1Import(c *C) {
 	}
 	password := os.Getenv("MYSQL_PSWD")
 
-	cfg1, err := config.LoadFromFile("./source.yaml")
+	cfg1, err := config.ParseYaml(config.SampleSourceConfig)
 	c.Assert(err, IsNil)
 	// fix empty map after marshal/unmarshal becomes nil
 	cfg1.From.Adjust()
@@ -78,7 +73,7 @@ func (t *testMaster) TestCollectSourceConfigFilesV1Import(c *C) {
 	cfg1.From.User = user
 	cfg1.From.Password = password
 	cfg1.RelayDir = "relay-dir"
-	c.Assert(checkAndAdjustSourceConfigFunc(ctx, cfg1), IsNil) // adjust source config.
+	c.Assert(checkAndAdjustSourceConfigForDMCtlFunc(ctx, cfg1), IsNil) // adjust source config.
 	cfg2 := cfg1.Clone()
 	cfg2.SourceID = "mysql-replica-02"
 
@@ -93,6 +88,9 @@ func (t *testMaster) TestCollectSourceConfigFilesV1Import(c *C) {
 	// collect again, two configs exist.
 	cfgs, err = s.collectSourceConfigFilesV1Import(tctx)
 	c.Assert(err, IsNil)
+	for _, cfg := range cfgs {
+		cfg.From.Session = nil
+	}
 	c.Assert(cfgs, HasLen, 2)
 	c.Assert(cfgs[cfg1.SourceID], DeepEquals, cfg1)
 	c.Assert(cfgs[cfg2.SourceID], DeepEquals, cfg2)
@@ -121,7 +119,7 @@ func (t *testMaster) TestWaitWorkersReadyV1Import(c *C) {
 	s.cfg.V1SourcesPath = c.MkDir()
 	c.Assert(s.scheduler.Start(ctx, t.etcdTestCli), IsNil)
 
-	cfg1, err := config.LoadFromFile("./source.yaml")
+	cfg1, err := config.ParseYaml(config.SampleSourceConfig)
 	c.Assert(err, IsNil)
 	cfg2 := cfg1.Clone()
 	cfg2.SourceID = "mysql-replica-02"
@@ -176,7 +174,7 @@ func (t *testMaster) TestSubtaskCfgsStagesV1Import(c *C) {
 	)
 
 	cfg11 := config.NewSubTaskConfig()
-	c.Assert(cfg11.DecodeFile(subTaskSampleFile, true), IsNil)
+	c.Assert(cfg11.Decode(config.SampleSubtaskConfig, true), IsNil)
 	cfg11.Dir = "./dump_data"
 	cfg11.ChunkFilesize = "64"
 	cfg11.Name = taskName1

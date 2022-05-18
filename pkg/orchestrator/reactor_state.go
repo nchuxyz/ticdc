@@ -19,10 +19,10 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/model"
-	cerrors "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/etcd"
-	"github.com/pingcap/ticdc/pkg/orchestrator/util"
+	"github.com/pingcap/tiflow/cdc/model"
+	cerrors "github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/etcd"
+	"github.com/pingcap/tiflow/pkg/orchestrator/util"
 	"go.uber.org/zap"
 )
 
@@ -32,10 +32,15 @@ type GlobalReactorState struct {
 	Captures       map[model.CaptureID]*model.CaptureInfo
 	Changefeeds    map[model.ChangeFeedID]*ChangefeedReactorState
 	pendingPatches [][]DataPatch
+
+	// onCaptureAdded and onCaptureRemoved are hook functions
+	// to be called when captures are added and removed.
+	onCaptureAdded   func(captureID model.CaptureID, addr string)
+	onCaptureRemoved func(captureID model.CaptureID)
 }
 
 // NewGlobalState creates a new global state
-func NewGlobalState() ReactorState {
+func NewGlobalState() *GlobalReactorState {
 	return &GlobalReactorState{
 		Owner:       map[string]struct{}{},
 		Captures:    make(map[model.CaptureID]*model.CaptureInfo),
@@ -60,8 +65,13 @@ func (s *GlobalReactorState) Update(key util.EtcdKey, value []byte, _ bool) erro
 		return nil
 	case etcd.CDCKeyTypeCapture:
 		if value == nil {
-			log.Info("remote capture offline", zap.String("capture-id", k.CaptureID))
+			log.Info("remote capture offline",
+				zap.String("captureID", k.CaptureID),
+				zap.Any("info", s.Captures[k.CaptureID]))
 			delete(s.Captures, k.CaptureID)
+			if s.onCaptureRemoved != nil {
+				s.onCaptureRemoved(k.CaptureID)
+			}
 			return nil
 		}
 
@@ -71,7 +81,11 @@ func (s *GlobalReactorState) Update(key util.EtcdKey, value []byte, _ bool) erro
 			return cerrors.ErrUnmarshalFailed.Wrap(err).GenWithStackByArgs()
 		}
 
-		log.Info("remote capture online", zap.String("capture-id", k.CaptureID), zap.Any("info", newCaptureInfo))
+		log.Info("remote capture online",
+			zap.String("captureID", k.CaptureID), zap.Any("info", newCaptureInfo))
+		if s.onCaptureAdded != nil {
+			s.onCaptureAdded(k.CaptureID, newCaptureInfo.AdvertiseAddr)
+		}
 		s.Captures[k.CaptureID] = &newCaptureInfo
 	case etcd.CDCKeyTypeChangefeedInfo,
 		etcd.CDCKeyTypeChangeFeedStatus,
@@ -100,6 +114,7 @@ func (s *GlobalReactorState) Update(key util.EtcdKey, value []byte, _ bool) erro
 }
 
 // GetPatches implements the ReactorState interface
+// Every []DataPatch slice in [][]DataPatch slice is the patches of a ChangefeedReactorState
 func (s *GlobalReactorState) GetPatches() [][]DataPatch {
 	pendingPatches := s.pendingPatches
 	for _, changefeedState := range s.Changefeeds {
@@ -109,14 +124,27 @@ func (s *GlobalReactorState) GetPatches() [][]DataPatch {
 	return pendingPatches
 }
 
+// SetOnCaptureAdded registers a function that is called when a capture goes online.
+func (s *GlobalReactorState) SetOnCaptureAdded(f func(captureID model.CaptureID, addr string)) {
+	s.onCaptureAdded = f
+}
+
+// SetOnCaptureRemoved registers a function that is called when a capture goes offline.
+func (s *GlobalReactorState) SetOnCaptureRemoved(f func(captureID model.CaptureID)) {
+	s.onCaptureRemoved = f
+}
+
 // ChangefeedReactorState represents a changefeed state which stores all key-value pairs of a changefeed in ETCD
 type ChangefeedReactorState struct {
 	ID            model.ChangeFeedID
 	Info          *model.ChangeFeedInfo
 	Status        *model.ChangeFeedStatus
 	TaskPositions map[model.CaptureID]*model.TaskPosition
-	TaskStatuses  map[model.CaptureID]*model.TaskStatus
-	Workloads     map[model.CaptureID]model.TaskWorkload
+
+	// Deprecated: No longer used, kept for compatibility.
+	TaskStatuses map[model.CaptureID]*model.TaskStatus
+	// Deprecated: No longer used, kept for compatibility.
+	Workloads map[model.CaptureID]model.TaskWorkload
 
 	pendingPatches        []DataPatch
 	skipPatchesInThisTick bool
@@ -209,7 +237,7 @@ func (s *ChangefeedReactorState) UpdateCDCKey(key *etcd.CDCKey, value []byte) er
 		return errors.Trace(err)
 	}
 	if key.Tp == etcd.CDCKeyTypeChangefeedInfo {
-		if err := s.Info.VerifyAndFix(); err != nil {
+		if err := s.Info.VerifyAndComplete(); err != nil {
 			return errors.Trace(err)
 		}
 	}
@@ -223,7 +251,7 @@ func (s *ChangefeedReactorState) Exist() bool {
 
 // Active return true if the changefeed is ready to be processed
 func (s *ChangefeedReactorState) Active(captureID model.CaptureID) bool {
-	return s.Info != nil && s.Status != nil && s.TaskStatuses[captureID] != nil
+	return s.Info != nil && s.Status != nil && s.Status.AdminJobType == model.AdminNone
 }
 
 // GetPatches implements the ReactorState interface
@@ -330,42 +358,8 @@ func (s *ChangefeedReactorState) PatchTaskPosition(captureID model.CaptureID, fn
 	})
 }
 
-// PatchTaskStatus appends a DataPatch which can modify the TaskStatus of a specified capture
-func (s *ChangefeedReactorState) PatchTaskStatus(captureID model.CaptureID, fn func(*model.TaskStatus) (*model.TaskStatus, bool, error)) {
-	key := &etcd.CDCKey{
-		Tp:           etcd.CDCKeyTypeTaskStatus,
-		CaptureID:    captureID,
-		ChangefeedID: s.ID,
-	}
-	s.patchAny(key.String(), taskStatusTPI, func(e interface{}) (interface{}, bool, error) {
-		// e == nil means that the key is not exist before this patch
-		if e == nil {
-			return fn(nil)
-		}
-		return fn(e.(*model.TaskStatus))
-	})
-}
-
-// PatchTaskWorkload appends a DataPatch which can modify the TaskWorkload of a specified capture
-func (s *ChangefeedReactorState) PatchTaskWorkload(captureID model.CaptureID, fn func(model.TaskWorkload) (model.TaskWorkload, bool, error)) {
-	key := &etcd.CDCKey{
-		Tp:           etcd.CDCKeyTypeTaskWorkload,
-		CaptureID:    captureID,
-		ChangefeedID: s.ID,
-	}
-	s.patchAny(key.String(), taskWorkloadTPI, func(e interface{}) (interface{}, bool, error) {
-		// e == nil means that the key is not exist before this patch
-		if e == nil {
-			return fn(nil)
-		}
-		return fn(*e.(*model.TaskWorkload))
-	})
-}
-
 var (
 	taskPositionTPI     *model.TaskPosition
-	taskStatusTPI       *model.TaskStatus
-	taskWorkloadTPI     *model.TaskWorkload
 	changefeedStatusTPI *model.ChangeFeedStatus
 	changefeedInfoTPI   *model.ChangeFeedInfo
 )

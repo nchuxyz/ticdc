@@ -14,12 +14,12 @@
 package util
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/tidb/util/timeutil"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
 )
 
 // GetTimezone returns the timezone specified by the name
@@ -35,7 +35,8 @@ func GetTimezone(name string) (tz *time.Location, err error) {
 	return
 }
 
-func getTimezoneFromZonefile(zonefile string) (tz *time.Location, err error) {
+// GetTimezoneFromZonefile read the timezone from file
+func GetTimezoneFromZonefile(zonefile string) (tz *time.Location, err error) {
 	// the linked path of `/etc/localtime` sample:
 	// MacOS: /var/db/timezone/zoneinfo/Asia/Shanghai
 	// Linux: /usr/share/zoneinfo/Asia/Shanghai
@@ -57,9 +58,6 @@ func GetLocalTimezone() (*time.Location, error) {
 	if time.Local.String() != "Local" {
 		return time.Local, nil
 	}
-	str, err := os.Readlink("/etc/localtime")
-	if err != nil {
-		return nil, cerror.WrapError(cerror.ErrLoadTimezone, err)
-	}
-	return getTimezoneFromZonefile(str)
+	str := timeutil.InferSystemTZ()
+	return GetTimezoneFromZonefile(str)
 }

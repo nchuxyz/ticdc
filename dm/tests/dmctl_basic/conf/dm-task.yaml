@@ -39,6 +39,8 @@ block-allow-list:
     do-tables:
     -  db-name: "dmctl"
        tbl-name: "~^t_[\\d]+"
+    -  db-name: "dmctl"
+       tbl-name: "flush_trigger"
 
 routes:
   sharding-route-rules-table:
@@ -86,6 +88,7 @@ syncers:
     batch: 100
     checkpoint-flush-interval: 1
     compact: true
+    multiple-rows: true
 
 filters:
   user-filter-1:

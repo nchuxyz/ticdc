@@ -20,20 +20,21 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/dustin/go-humanize"
 	bf "github.com/pingcap/tidb-tools/pkg/binlog-filter"
 	"github.com/pingcap/tidb-tools/pkg/column-mapping"
-	"github.com/pingcap/tidb-tools/pkg/filter"
-	router "github.com/pingcap/tidb-tools/pkg/table-router"
 	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/util/filter"
+	router "github.com/pingcap/tidb/util/table-router"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v2"
 
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 // Online DDL Scheme.
@@ -50,14 +51,34 @@ const (
 	tidbTxnOptimistic = "optimistic"
 )
 
+// collation_compatible.
+const (
+	LooseCollationCompatible  = "loose"
+	StrictCollationCompatible = "strict"
+)
+
+const (
+	ValidationNone = "none"
+	ValidationFast = "fast"
+	ValidationFull = "full"
+
+	DefaultValidatorWorkerCount       = 4
+	DefaultValidatorValidateInterval  = 10 * time.Second
+	DefaultValidatorCheckInterval     = 5 * time.Second
+	DefaultValidatorRowErrorDelay     = 30 * time.Minute
+	DefaultValidatorMetaFlushInterval = 1 * time.Minute
+	DefaultValidatorBatchQuerySize    = 100
+)
+
 // default config item values.
 var (
 	// TaskConfig.
-	defaultMetaSchema      = "dm_meta"
-	defaultEnableHeartbeat = false
-	defaultIsSharding      = false
-	defaultUpdateInterval  = 1
-	defaultReportInterval  = 10
+	defaultMetaSchema          = "dm_meta"
+	defaultEnableHeartbeat     = false
+	defaultIsSharding          = false
+	defaultUpdateInterval      = 1
+	defaultReportInterval      = 10
+	defaultCollationCompatible = "loose"
 	// MydumperConfig.
 	defaultMydumperPath  = "./bin/mydumper"
 	defaultThreads       = 4
@@ -71,8 +92,6 @@ var (
 	defaultBatch                   = 100
 	defaultQueueSize               = 1024 // do not give too large default value to avoid OOM
 	defaultCheckpointFlushInterval = 30   // in seconds
-	// force use UTC time_zone.
-	defaultTimeZone = "+00:00"
 
 	// TargetDBConfig.
 	defaultSessionCfg = []struct {
@@ -131,6 +150,9 @@ type MySQLInstance struct {
 	Syncer           *SyncerConfig `yaml:"syncer"`
 	// SyncerThread is alias for WorkerCount in SyncerConfig, and its priority is higher than WorkerCount
 	SyncerThread int `yaml:"syncer-thread"`
+
+	ContinuousValidatorConfigName string          `yaml:"continuous-validator-config-name"`
+	ContinuousValidator           ValidatorConfig `yaml:"-"`
 }
 
 // VerifyAndAdjust does verification on configs, and adjust some configs.
@@ -202,18 +224,43 @@ func (m *MydumperConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 	return nil
 }
 
+// LoadMode defines different mode used in load phase.
+type LoadMode string
+
+const (
+	// LoadModeSQL means write data by sql statements, uses tidb-lightning tidb backend to load data.
+	LoadModeSQL LoadMode = "sql"
+	// LoadModeLoader is the legacy sql mode, use loader to load data. this should be replaced by sql mode in new version.
+	LoadModeLoader = "loader"
+)
+
+// DuplicateResolveType defines the duplication resolution when meet duplicate rows.
+type DuplicateResolveType string
+
+const (
+	// OnDuplicateReplace represents replace the old row with new data.
+	OnDuplicateReplace DuplicateResolveType = "replace"
+	// OnDuplicateError represents return an error when meet duplicate row.
+	OnDuplicateError = "error"
+	// OnDuplicateIgnore represents ignore the new data when meet duplicate row.
+	OnDuplicateIgnore = "ignore"
+)
+
 // LoaderConfig represents loader process unit's specific config.
 type LoaderConfig struct {
-	PoolSize int    `yaml:"pool-size" toml:"pool-size" json:"pool-size"`
-	Dir      string `yaml:"dir" toml:"dir" json:"dir"`
-	SQLMode  string `yaml:"-" toml:"-" json:"-"` // wrote by dump unit
+	PoolSize    int                  `yaml:"pool-size" toml:"pool-size" json:"pool-size"`
+	Dir         string               `yaml:"dir" toml:"dir" json:"dir"`
+	SQLMode     string               `yaml:"-" toml:"-" json:"-"` // wrote by dump unit
+	ImportMode  LoadMode             `yaml:"import-mode" toml:"import-mode" json:"import-mode"`
+	OnDuplicate DuplicateResolveType `yaml:"on-duplicate" toml:"on-duplicate" json:"on-duplicate"`
 }
 
 // DefaultLoaderConfig return default loader config for task.
 func DefaultLoaderConfig() LoaderConfig {
 	return LoaderConfig{
-		PoolSize: defaultPoolSize,
-		Dir:      defaultDir,
+		PoolSize:   defaultPoolSize,
+		Dir:        defaultDir,
+		ImportMode: LoadModeSQL,
 	}
 }
 
@@ -230,6 +277,26 @@ func (m *LoaderConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+func (m *LoaderConfig) adjust() error {
+	if m.ImportMode == "" {
+		m.ImportMode = LoadModeSQL
+	}
+	m.ImportMode = LoadMode(strings.ToLower(string(m.ImportMode)))
+	if m.ImportMode != LoadModeSQL && m.ImportMode != LoadModeLoader {
+		return terror.ErrConfigInvalidLoadMode.Generate(m.ImportMode)
+	}
+
+	if m.OnDuplicate == "" {
+		m.OnDuplicate = OnDuplicateReplace
+	}
+	m.OnDuplicate = DuplicateResolveType(strings.ToLower(string(m.OnDuplicate)))
+	if m.OnDuplicate != OnDuplicateReplace && m.OnDuplicate != OnDuplicateError && m.OnDuplicate != OnDuplicateIgnore {
+		return terror.ErrConfigInvalidDuplicateResolution.Generate(m.OnDuplicate)
+	}
+
+	return nil
+}
+
 // SyncerConfig represents syncer process unit's specific config.
 type SyncerConfig struct {
 	MetaFile    string `yaml:"meta-file" toml:"meta-file" json:"meta-file"` // meta filename, used only when load SubConfig directly
@@ -237,13 +304,15 @@ type SyncerConfig struct {
 	Batch       int    `yaml:"batch" toml:"batch" json:"batch"`
 	QueueSize   int    `yaml:"queue-size" toml:"queue-size" json:"queue-size"`
 	// checkpoint flush interval in seconds.
-	CheckpointFlushInterval int  `yaml:"checkpoint-flush-interval" toml:"checkpoint-flush-interval" json:"checkpoint-flush-interval"`
-	Compact                 bool `yaml:"compact" toml:"compact" json:"compact"`
+	CheckpointFlushInterval int `yaml:"checkpoint-flush-interval" toml:"checkpoint-flush-interval" json:"checkpoint-flush-interval"`
+	// TODO: add this two new config items for openapi.
+	Compact      bool `yaml:"compact" toml:"compact" json:"compact"`
+	MultipleRows bool `yaml:"multiple-rows" toml:"multiple-rows" json:"multiple-rows"`
 
 	// deprecated
 	MaxRetry int `yaml:"max-retry" toml:"max-retry" json:"max-retry"`
 
-	// refine following configs to top level configs?
+	// deprecated
 	AutoFixGTID bool `yaml:"auto-fix-gtid" toml:"auto-fix-gtid" json:"auto-fix-gtid"`
 	EnableGTID  bool `yaml:"enable-gtid" toml:"enable-gtid" json:"enable-gtid"`
 	// deprecated
@@ -276,6 +345,50 @@ func (m *SyncerConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+type ValidatorConfig struct {
+	Mode              string   `yaml:"mode" toml:"mode" json:"mode"`
+	WorkerCount       int      `yaml:"worker-count" toml:"worker-count" json:"worker-count"`
+	ValidateInterval  Duration `yaml:"validate-interval" toml:"validate-interval" json:"validate-interval"`
+	CheckInterval     Duration `yaml:"check-interval" toml:"check-interval" json:"check-interval"`
+	RowErrorDelay     Duration `yaml:"row-error-delay" toml:"row-error-delay" json:"row-error-delay"`
+	MetaFlushInterval Duration `yaml:"meta-flush-interval" toml:"meta-flush-interval" json:"meta-flush-interval"`
+	BatchQuerySize    int      `yaml:"batch-query-size" toml:"batch-query-size" json:"batch-query-size"`
+}
+
+func (v *ValidatorConfig) Adjust() error {
+	if v.Mode == "" {
+		v.Mode = ValidationNone
+	}
+	if v.Mode != ValidationNone && v.Mode != ValidationFast && v.Mode != ValidationFull {
+		return terror.ErrConfigValidationMode
+	}
+	if v.WorkerCount <= 0 {
+		v.WorkerCount = DefaultValidatorWorkerCount
+	}
+	if v.ValidateInterval.Duration == 0 {
+		v.ValidateInterval.Duration = DefaultValidatorValidateInterval
+	}
+	if v.CheckInterval.Duration == 0 {
+		v.CheckInterval.Duration = DefaultValidatorCheckInterval
+	}
+	if v.RowErrorDelay.Duration == 0 {
+		v.RowErrorDelay.Duration = DefaultValidatorRowErrorDelay
+	}
+	if v.MetaFlushInterval.Duration == 0 {
+		v.MetaFlushInterval.Duration = DefaultValidatorMetaFlushInterval
+	}
+	if v.BatchQuerySize == 0 {
+		v.BatchQuerySize = DefaultValidatorBatchQuerySize
+	}
+	return nil
+}
+
+func defaultValidatorConfig() ValidatorConfig {
+	return ValidatorConfig{
+		Mode: ValidationNone,
+	}
+}
+
 // TaskConfig is the configuration for Task.
 type TaskConfig struct {
 	*flag.FlagSet `yaml:"-" toml:"-" json:"-"`
@@ -294,13 +407,16 @@ type TaskConfig struct {
 	// deprecated
 	HeartbeatUpdateInterval int `yaml:"heartbeat-update-interval" toml:"heartbeat-update-interval" json:"heartbeat-update-interval"`
 	// deprecated
-	HeartbeatReportInterval int `yaml:"heartbeat-report-interval" toml:"heartbeat-report-interval" json:"heartbeat-report-interval"`
-	// deprecated
-	Timezone string `yaml:"timezone" toml:"timezone" json:"timezone"`
+	HeartbeatReportInterval int    `yaml:"heartbeat-report-interval" toml:"heartbeat-report-interval" json:"heartbeat-report-interval"`
+	Timezone                string `yaml:"timezone" toml:"timezone" json:"timezone"`
 
 	// handle schema/table name mode, and only for schema/table name
 	// if case insensitive, we would convert schema/table name to lower case
 	CaseSensitive bool `yaml:"case-sensitive" toml:"case-sensitive" json:"case-sensitive"`
+
+	// default "loose" handle create sql by original sql, will not add default collation as upstream
+	// "strict" will add default collation as upstream, and downstream will occur error when downstream don't support
+	CollationCompatible string `yaml:"collation_compatible" toml:"collation_compatible" json:"collation_compatible"`
 
 	TargetDB *DBConfig `yaml:"target-database" toml:"target-database" json:"target-database"`
 
@@ -323,9 +439,10 @@ type TaskConfig struct {
 	BWList map[string]*filter.Rules `yaml:"black-white-list" toml:"black-white-list" json:"black-white-list"`
 	BAList map[string]*filter.Rules `yaml:"block-allow-list" toml:"block-allow-list" json:"block-allow-list"`
 
-	Mydumpers map[string]*MydumperConfig `yaml:"mydumpers" toml:"mydumpers" json:"mydumpers"`
-	Loaders   map[string]*LoaderConfig   `yaml:"loaders" toml:"loaders" json:"loaders"`
-	Syncers   map[string]*SyncerConfig   `yaml:"syncers" toml:"syncers" json:"syncers"`
+	Mydumpers  map[string]*MydumperConfig  `yaml:"mydumpers" toml:"mydumpers" json:"mydumpers"`
+	Loaders    map[string]*LoaderConfig    `yaml:"loaders" toml:"loaders" json:"loaders"`
+	Syncers    map[string]*SyncerConfig    `yaml:"syncers" toml:"syncers" json:"syncers"`
+	Validators map[string]*ValidatorConfig `yaml:"validators" toml:"validators" json:"validators"`
 
 	CleanDumpFile bool `yaml:"clean-dump-file" toml:"clean-dump-file" json:"clean-dump-file"`
 	// deprecated
@@ -334,8 +451,10 @@ type TaskConfig struct {
 	// deprecated, replaced by `start-task --remove-meta`
 	RemoveMeta bool `yaml:"remove-meta"`
 
-	// extra config when target db is TiDB
-	TiDB *TiDBExtraConfig `yaml:"tidb" toml:"tidb" json:"tidb"`
+	// task experimental configs
+	Experimental struct {
+		AsyncCheckpointFlush bool `yaml:"async-checkpoint-flush" toml:"async-checkpoint-flush" json:"async-checkpoint-flush"`
+	} `yaml:"experimental" toml:"experimental" json:"experimental"`
 }
 
 // NewTaskConfig creates a TaskConfig.
@@ -357,7 +476,10 @@ func NewTaskConfig() *TaskConfig {
 		Mydumpers:               make(map[string]*MydumperConfig),
 		Loaders:                 make(map[string]*LoaderConfig),
 		Syncers:                 make(map[string]*SyncerConfig),
+		Validators:              make(map[string]*ValidatorConfig),
 		CleanDumpFile:           true,
+		OnlineDDL:               true,
+		CollationCompatible:     defaultCollationCompatible,
 	}
 	cfg.FlagSet = flag.NewFlagSet("task", flag.ContinueOnError)
 	return cfg
@@ -413,7 +535,7 @@ func (c *TaskConfig) RawDecode(data string) error {
 }
 
 // find unused items in config.
-var configRefPrefixes = []string{"RouteRules", "FilterRules", "ColumnMappingRules", "Mydumper", "Loader", "Syncer", "ExprFilter"}
+var configRefPrefixes = []string{"RouteRules", "FilterRules", "ColumnMappingRules", "Mydumper", "Loader", "Syncer", "ExprFilter", "Validator"}
 
 const (
 	routeRulesIdx = iota
@@ -423,9 +545,17 @@ const (
 	loaderIdx
 	syncerIdx
 	exprFilterIdx
+	validatorIdx
 )
 
-// adjust adjusts and verifies config.
+// Adjust adjusts and verifies config.
+func (c *TaskConfig) Adjust() error {
+	if c == nil {
+		return terror.ErrConfigYamlTransform.New("task config is nil")
+	}
+	return c.adjust()
+}
+
 func (c *TaskConfig) adjust() error {
 	if len(c.Name) == 0 {
 		return terror.ErrConfigNeedUniqueTaskName.Generate()
@@ -438,6 +568,12 @@ func (c *TaskConfig) adjust() error {
 		return terror.ErrConfigShardModeNotSupport.Generate(c.ShardMode)
 	} else if c.ShardMode == "" && c.IsSharding {
 		c.ShardMode = ShardPessimistic // use the pessimistic mode as default for back compatible.
+	}
+
+	if c.CollationCompatible != "" && c.CollationCompatible != LooseCollationCompatible && c.CollationCompatible != StrictCollationCompatible {
+		return terror.ErrConfigCollationCompatibleNotSupport.Generate(c.CollationCompatible)
+	} else if c.CollationCompatible == "" {
+		c.CollationCompatible = LooseCollationCompatible
 	}
 
 	for _, item := range c.IgnoreCheckingItems {
@@ -499,6 +635,12 @@ func (c *TaskConfig) adjust() error {
 		}
 	}
 
+	for _, validatorCfg := range c.Validators {
+		if err := validatorCfg.Adjust(); err != nil {
+			return err
+		}
+	}
+
 	instanceIDs := make(map[string]int) // source-id -> instance-index
 	globalConfigReferCount := map[string]int{}
 	duplicateErrorStrings := make([]string, 0)
@@ -518,7 +660,7 @@ func (c *TaskConfig) adjust() error {
 			}
 		case ModeIncrement:
 			if inst.Meta == nil {
-				return terror.ErrConfigMetadataNotSet.Generate(i, c.TaskMode)
+				return terror.ErrConfigMetadataNotSet.Generate(inst.SourceID, c.TaskMode)
 			}
 			err := inst.Meta.Verify()
 			if err != nil {
@@ -559,8 +701,10 @@ func (c *TaskConfig) adjust() error {
 				return terror.ErrConfigMydumperCfgNotFound.Generate(i, inst.MydumperConfigName)
 			}
 			globalConfigReferCount[configRefPrefixes[mydumperIdx]+inst.MydumperConfigName]++
-			inst.Mydumper = new(MydumperConfig)
-			*inst.Mydumper = *rule // ref mydumper config
+			if rule != nil {
+				inst.Mydumper = new(MydumperConfig)
+				*inst.Mydumper = *rule // ref mydumper config
+			}
 		}
 		if inst.Mydumper == nil {
 			if len(c.Mydumpers) != 0 {
@@ -587,8 +731,10 @@ func (c *TaskConfig) adjust() error {
 				return terror.ErrConfigLoaderCfgNotFound.Generate(i, inst.LoaderConfigName)
 			}
 			globalConfigReferCount[configRefPrefixes[loaderIdx]+inst.LoaderConfigName]++
-			inst.Loader = new(LoaderConfig)
-			*inst.Loader = *rule // ref loader config
+			if rule != nil {
+				inst.Loader = new(LoaderConfig)
+				*inst.Loader = *rule // ref loader config
+			}
 		}
 		if inst.Loader == nil {
 			if len(c.Loaders) != 0 {
@@ -607,8 +753,10 @@ func (c *TaskConfig) adjust() error {
 				return terror.ErrConfigSyncerCfgNotFound.Generate(i, inst.SyncerConfigName)
 			}
 			globalConfigReferCount[configRefPrefixes[syncerIdx]+inst.SyncerConfigName]++
-			inst.Syncer = new(SyncerConfig)
-			*inst.Syncer = *rule // ref syncer config
+			if rule != nil {
+				inst.Syncer = new(SyncerConfig)
+				*inst.Syncer = *rule // ref syncer config
+			}
 		}
 		if inst.Syncer == nil {
 			if len(c.Syncers) != 0 {
@@ -619,6 +767,18 @@ func (c *TaskConfig) adjust() error {
 		}
 		if inst.SyncerThread != 0 {
 			inst.Syncer.WorkerCount = inst.SyncerThread
+		}
+
+		inst.ContinuousValidator = defaultValidatorConfig()
+		if inst.ContinuousValidatorConfigName != "" {
+			rule, ok := c.Validators[inst.ContinuousValidatorConfigName]
+			if !ok {
+				return terror.ErrContinuousValidatorCfgNotFound.Generate(i, inst.ContinuousValidatorConfigName)
+			}
+			globalConfigReferCount[configRefPrefixes[validatorIdx]+inst.ContinuousValidatorConfigName]++
+			if rule != nil {
+				inst.ContinuousValidator = *rule
+			}
 		}
 
 		// for backward compatible, set global config `ansi-quotes: true` if any syncer is true
@@ -674,7 +834,13 @@ func (c *TaskConfig) adjust() error {
 			unusedConfigs = append(unusedConfigs, mydumper)
 		}
 	}
-	for loader := range c.Loaders {
+
+	for loader, cfg := range c.Loaders {
+		if cfg != nil {
+			if err1 := cfg.adjust(); err1 != nil {
+				return err1
+			}
+		}
 		if globalConfigReferCount[configRefPrefixes[loaderIdx]+loader] == 0 {
 			unusedConfigs = append(unusedConfigs, loader)
 		}
@@ -689,14 +855,22 @@ func (c *TaskConfig) adjust() error {
 			unusedConfigs = append(unusedConfigs, exprFilter)
 		}
 	}
+	for key := range c.Validators {
+		if globalConfigReferCount[configRefPrefixes[validatorIdx]+key] == 0 {
+			unusedConfigs = append(unusedConfigs, key)
+		}
+	}
 
 	if len(unusedConfigs) != 0 {
 		sort.Strings(unusedConfigs)
 		return terror.ErrConfigGlobalConfigsUnused.Generate(unusedConfigs)
 	}
+
+	// we postpone default time_zone init in each unit so we won't change the config value in task/sub_task config
 	if c.Timezone != "" {
-		log.L().Warn("`timezone` is deprecated and useless anymore, please remove it.")
-		c.Timezone = ""
+		if _, err := utils.ParseTimeZone(c.Timezone); err != nil {
+			return err
+		}
 	}
 	if c.RemoveMeta {
 		log.L().Warn("`remove-meta` in task config is deprecated, please use `start-task ... --remove-meta` instead")
@@ -758,29 +932,25 @@ func AdjustTargetDBSessionCfg(dbConfig *DBConfig, version *semver.Version) {
 			lowerMap[cfg.key] = cfg.val
 		}
 	}
-	// force set time zone to UTC
-	if tz, ok := lowerMap["time_zone"]; ok {
-		log.L().Warn("session variable 'time_zone' is overwritten with UTC timezone.",
-			zap.String("time_zone", tz))
-	}
-	lowerMap["time_zone"] = defaultTimeZone
 	dbConfig.Session = lowerMap
 }
 
-// AdjustTargetDBTimeZone force adjust session `time_zone` to UTC.
-func AdjustTargetDBTimeZone(config *DBConfig) {
-	for k := range config.Session {
+// AdjustDBTimeZone force adjust session `time_zone`.
+func AdjustDBTimeZone(config *DBConfig, timeZone string) {
+	for k, v := range config.Session {
 		if strings.ToLower(k) == "time_zone" {
-			log.L().Warn("session variable 'time_zone' is overwritten by default UTC timezone.",
-				zap.String("time_zone", config.Session[k]))
-			config.Session[k] = defaultTimeZone
+			if v != timeZone {
+				log.L().Warn("session variable 'time_zone' is overwritten by task config's timezone",
+					zap.String("time_zone", config.Session[k]))
+				config.Session[k] = timeZone
+			}
 			return
 		}
 	}
 	if config.Session == nil {
 		config.Session = make(map[string]string, 1)
 	}
-	config.Session["time_zone"] = defaultTimeZone
+	config.Session["time_zone"] = timeZone
 }
 
 var defaultParser = parser.New()
@@ -858,6 +1028,25 @@ func NewMySQLInstancesForDowngrade(mysqlInstances []*MySQLInstance) []*MySQLInst
 	return mysqlInstancesForDowngrade
 }
 
+// LoaderConfigForDowngrade is the base configuration for loader in v2.0.
+// This config is used for downgrade(config export) from a higher dmctl version.
+// When we add any new config item into LoaderConfig, we should update it also.
+type LoaderConfigForDowngrade struct {
+	PoolSize int    `yaml:"pool-size" toml:"pool-size" json:"pool-size"`
+	Dir      string `yaml:"dir" toml:"dir" json:"dir"`
+}
+
+func NewLoaderConfigForDowngrade(loaderConfigs map[string]*LoaderConfig) map[string]*LoaderConfigForDowngrade {
+	loaderConfigsForDowngrade := make(map[string]*LoaderConfigForDowngrade, len(loaderConfigs))
+	for k, v := range loaderConfigs {
+		loaderConfigsForDowngrade[k] = &LoaderConfigForDowngrade{
+			PoolSize: v.PoolSize,
+			Dir:      v.Dir,
+		}
+	}
+	return loaderConfigsForDowngrade
+}
+
 // SyncerConfigForDowngrade is the base configuration for syncer in v2.0.
 // This config is used for downgrade(config export) from a higher dmctl version.
 // When we add any new config item into SyncerConfig, we should update it also.
@@ -868,13 +1057,13 @@ type SyncerConfigForDowngrade struct {
 	QueueSize               int    `yaml:"queue-size"`
 	CheckpointFlushInterval int    `yaml:"checkpoint-flush-interval"`
 	MaxRetry                int    `yaml:"max-retry"`
-	AutoFixGTID             bool   `yaml:"auto-fix-gtid"`
 	EnableGTID              bool   `yaml:"enable-gtid"`
 	DisableCausality        bool   `yaml:"disable-detect"`
 	SafeMode                bool   `yaml:"safe-mode"`
 	EnableANSIQuotes        bool   `yaml:"enable-ansi-quotes"`
 
-	Compact bool `yaml:"compact,omitempty"`
+	Compact      bool `yaml:"compact,omitempty"`
+	MultipleRows bool `yaml:"multipleRows,omitempty"`
 }
 
 // NewSyncerConfigsForDowngrade converts SyncerConfig to SyncerConfigForDowngrade.
@@ -888,12 +1077,12 @@ func NewSyncerConfigsForDowngrade(syncerConfigs map[string]*SyncerConfig) map[st
 			QueueSize:               syncerConfig.QueueSize,
 			CheckpointFlushInterval: syncerConfig.CheckpointFlushInterval,
 			MaxRetry:                syncerConfig.MaxRetry,
-			AutoFixGTID:             syncerConfig.AutoFixGTID,
 			EnableGTID:              syncerConfig.EnableGTID,
 			DisableCausality:        syncerConfig.DisableCausality,
 			SafeMode:                syncerConfig.SafeMode,
 			EnableANSIQuotes:        syncerConfig.EnableANSIQuotes,
 			Compact:                 syncerConfig.Compact,
+			MultipleRows:            syncerConfig.MultipleRows,
 		}
 		syncerConfigsForDowngrade[configName] = newSyncerConfig
 	}
@@ -923,7 +1112,7 @@ type TaskConfigForDowngrade struct {
 	BWList                  map[string]*filter.Rules             `yaml:"black-white-list"`
 	BAList                  map[string]*filter.Rules             `yaml:"block-allow-list"`
 	Mydumpers               map[string]*MydumperConfig           `yaml:"mydumpers"`
-	Loaders                 map[string]*LoaderConfig             `yaml:"loaders"`
+	Loaders                 map[string]*LoaderConfigForDowngrade `yaml:"loaders"`
 	Syncers                 map[string]*SyncerConfigForDowngrade `yaml:"syncers"`
 	CleanDumpFile           bool                                 `yaml:"clean-dump-file"`
 	EnableANSIQuotes        bool                                 `yaml:"ansi-quotes"`
@@ -958,7 +1147,7 @@ func NewTaskConfigForDowngrade(taskConfig *TaskConfig) *TaskConfigForDowngrade {
 		BWList:                  taskConfig.BWList,
 		BAList:                  taskConfig.BAList,
 		Mydumpers:               taskConfig.Mydumpers,
-		Loaders:                 taskConfig.Loaders,
+		Loaders:                 NewLoaderConfigForDowngrade(taskConfig.Loaders),
 		Syncers:                 NewSyncerConfigsForDowngrade(taskConfig.Syncers),
 		CleanDumpFile:           taskConfig.CleanDumpFile,
 		EnableANSIQuotes:        taskConfig.EnableANSIQuotes,
@@ -975,17 +1164,13 @@ func NewTaskConfigForDowngrade(taskConfig *TaskConfig) *TaskConfigForDowngrade {
 // If any default value for new config item is not empty(0 or false or nil),
 // we should change it to empty.
 func (c *TaskConfigForDowngrade) omitDefaultVals() {
-	if len(c.TargetDB.Session) > 0 {
-		if timeZone, ok := c.TargetDB.Session["time_zone"]; ok && timeZone == defaultTimeZone {
-			delete(c.TargetDB.Session, "time_zone")
-		}
-	}
 	if len(c.ShadowTableRules) == 1 && c.ShadowTableRules[0] == DefaultShadowTableRules {
 		c.ShadowTableRules = nil
 	}
 	if len(c.TrashTableRules) == 1 && c.TrashTableRules[0] == DefaultTrashTableRules {
 		c.TrashTableRules = nil
 	}
+	c.OnlineDDL = false
 }
 
 // Yaml returns YAML format representation of config.

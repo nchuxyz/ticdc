@@ -21,17 +21,18 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/integration"
+	"github.com/pingcap/tidb/util/dbutil"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/tests/v3/integration"
 
-	"github.com/pingcap/ticdc/dm/dm/common"
-	"github.com/pingcap/ticdc/dm/pkg/utils"
+	"github.com/pingcap/tiflow/dm/dm/common"
+	"github.com/pingcap/tiflow/dm/pkg/utils"
 )
 
 var etcdTestCli *clientv3.Client
 
 func TestInfo(t *testing.T) {
+	integration.BeforeTestExternal(t)
 	mockCluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer mockCluster.Terminate(t)
 

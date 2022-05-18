@@ -18,15 +18,16 @@ import (
 	"time"
 
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/entry"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/cdc/redo"
-	"github.com/pingcap/ticdc/cdc/sink"
-	"github.com/pingcap/ticdc/cdc/sink/common"
-	serverConfig "github.com/pingcap/ticdc/pkg/config"
-	cdcContext "github.com/pingcap/ticdc/pkg/context"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/pipeline"
+	"github.com/pingcap/tiflow/cdc/entry"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/redo"
+	"github.com/pingcap/tiflow/cdc/sink"
+	"github.com/pingcap/tiflow/cdc/sink/flowcontrol"
+	serverConfig "github.com/pingcap/tiflow/pkg/config"
+	cdcContext "github.com/pingcap/tiflow/pkg/context"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/pipeline"
+	pmessage "github.com/pingcap/tiflow/pkg/pipeline/message"
 	"go.uber.org/zap"
 )
 
@@ -65,7 +66,7 @@ type tablePipelineImpl struct {
 
 	tableID     int64
 	markTableID int64
-	tableName   string // quoted schema and table, used in metircs only
+	tableName   string // quoted schema and table, used in metrics only
 
 	sorterNode *sorterNode
 	sinkNode   *sinkNode
@@ -77,7 +78,7 @@ type tablePipelineImpl struct {
 // TODO find a better name or avoid using an interface
 // We use an interface here for ease in unit testing.
 type tableFlowController interface {
-	Consume(commitTs uint64, size uint64, blockCallBack func() error) error
+	Consume(msg *model.PolymorphicEvent, size uint64, blockCallBack func(batch bool) error) error
 	Release(resolvedTs uint64)
 	Abort()
 	GetConsumption() uint64
@@ -90,7 +91,7 @@ func (t *tablePipelineImpl) ResolvedTs() model.Ts {
 	// another replication barrier for consistent replication instead of reusing
 	// the global resolved-ts.
 	if redo.IsConsistentEnabled(t.replConfig.Consistent.Level) {
-		return t.sinkNode.ResolvedTs()
+		return t.sinkNode.ResolvedTs().Ts
 	}
 	return t.sorterNode.ResolvedTs()
 }
@@ -102,16 +103,16 @@ func (t *tablePipelineImpl) CheckpointTs() model.Ts {
 
 // UpdateBarrierTs updates the barrier ts in this table pipeline
 func (t *tablePipelineImpl) UpdateBarrierTs(ts model.Ts) {
-	err := t.p.SendToFirstNode(pipeline.BarrierMessage(ts))
+	err := t.p.SendToFirstNode(pmessage.BarrierMessage(ts))
 	if err != nil && !cerror.ErrSendToClosedPipeline.Equal(err) && !cerror.ErrPipelineTryAgain.Equal(err) {
 		log.Panic("unexpect error from send to first node", zap.Error(err))
 	}
 }
 
-// AsyncStop tells the pipeline to stop, and returns true is the pipeline is already stopped.
+// AsyncStop tells the pipeline to stop, and returns true if the pipeline is already stopped.
 func (t *tablePipelineImpl) AsyncStop(targetTs model.Ts) bool {
-	err := t.p.SendToFirstNode(pipeline.CommandMessage(&pipeline.Command{
-		Tp: pipeline.CommandTypeStop,
+	err := t.p.SendToFirstNode(pmessage.CommandMessage(&pmessage.Command{
+		Tp: pmessage.CommandTypeStop,
 	}))
 	log.Info("send async stop signal to table", zap.Int64("tableID", t.tableID), zap.Uint64("targetTs", targetTs))
 	if err != nil {
@@ -135,7 +136,7 @@ func (t *tablePipelineImpl) Workload() model.WorkloadInfo {
 	return workload
 }
 
-// Status returns the status of this table pipeline
+// Status returns the status of this table pipeline, sinkNode maintains the table status
 func (t *tablePipelineImpl) Status() TableStatus {
 	return t.sinkNode.Status()
 }
@@ -164,9 +165,9 @@ func (t *tablePipelineImpl) Wait() {
 // replicating 1024 tables in the worst case.
 const defaultOutputChannelSize = 64
 
-// There are 5 or 6 runners in table pipeline: header, puller, sorter, mounter,
+// There are 4 or 5 runners in table pipeline: header, puller, sorter,
 // sink, cyclic if cyclic replication is enabled
-const defaultRunnersSize = 5
+const defaultRunnersSize = 4
 
 // NewTablePipeline creates a table pipeline
 // TODO(leoppro): implement a mock kvclient to test the table pipeline
@@ -176,23 +177,27 @@ func NewTablePipeline(ctx cdcContext.Context,
 	tableName string,
 	replicaInfo *model.TableReplicaInfo,
 	sink sink.Sink,
-	targetTs model.Ts) TablePipeline {
+	targetTs model.Ts,
+) TablePipeline {
 	ctx, cancel := cdcContext.WithCancel(ctx)
+	changefeed := ctx.ChangefeedVars().ID
+	replConfig := ctx.ChangefeedVars().Info.Config
 	tablePipeline := &tablePipelineImpl{
 		tableID:     tableID,
 		markTableID: replicaInfo.MarkTableID,
 		tableName:   tableName,
 		cancel:      cancel,
-		replConfig:  ctx.ChangefeedVars().Info.Config,
+		replConfig:  replConfig,
 	}
 
 	perTableMemoryQuota := serverConfig.GetGlobalServerConfig().PerTableMemoryQuota
 	log.Debug("creating table flow controller",
-		zap.String("changefeed-id", ctx.ChangefeedVars().ID),
-		zap.String("table-name", tableName),
-		zap.Int64("table-id", tableID),
+		zap.String("namesapce", ctx.ChangefeedVars().ID.Namespace),
+		zap.String("changefeed", ctx.ChangefeedVars().ID.ID),
+		zap.String("tableName", tableName),
+		zap.Int64("tableID", tableID),
 		zap.Uint64("quota", perTableMemoryQuota))
-	flowController := common.NewTableFlowController(perTableMemoryQuota)
+	flowController := flowcontrol.NewTableFlowController(perTableMemoryQuota)
 	config := ctx.ChangefeedVars().Info.Config
 	cyclicEnabled := config.Cyclic != nil && config.Cyclic.IsEnabled()
 	runnerSize := defaultRunnersSize
@@ -201,12 +206,12 @@ func NewTablePipeline(ctx cdcContext.Context,
 	}
 
 	p := pipeline.NewPipeline(ctx, 500*time.Millisecond, runnerSize, defaultOutputChannelSize)
-	sorterNode := newSorterNode(tableName, tableID, replicaInfo.StartTs, flowController, mounter)
-	sinkNode := newSinkNode(sink, replicaInfo.StartTs, targetTs, flowController)
+	sorterNode := newSorterNode(tableName, tableID, replicaInfo.StartTs,
+		flowController, mounter, replConfig)
+	sinkNode := newSinkNode(tableID, sink, replicaInfo.StartTs, targetTs, flowController)
 
-	p.AppendNode(ctx, "puller", newPullerNode(tableID, replicaInfo, tableName))
+	p.AppendNode(ctx, "puller", newPullerNode(tableID, replicaInfo, tableName, changefeed))
 	p.AppendNode(ctx, "sorter", sorterNode)
-	p.AppendNode(ctx, "mounter", newMounterNode())
 	if cyclicEnabled {
 		p.AppendNode(ctx, "cyclic", newCyclicMarkNode(replicaInfo.MarkTableID))
 	}

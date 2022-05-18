@@ -20,24 +20,26 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"github.com/pingcap/tidb-tools/pkg/filter"
-	router "github.com/pingcap/tidb-tools/pkg/table-router"
 	"github.com/pingcap/tidb/parser/model"
 	tmysql "github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
-	"github.com/shopspring/decimal"
+	"github.com/pingcap/tidb/util/dbutil"
+	"github.com/pingcap/tidb/util/filter"
+	regexprrouter "github.com/pingcap/tidb/util/regexpr-router"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/ticdc/dm/pkg/log"
-	"github.com/pingcap/ticdc/dm/pkg/terror"
+	"github.com/pingcap/tiflow/dm/pkg/log"
+	"github.com/pingcap/tiflow/dm/pkg/terror"
 )
+
+func init() {
+	ZeroSessionCtx = NewSessionCtx(nil)
+}
 
 // TrimCtrlChars returns a slice of the string s with all leading
 // and trailing control characters removed.
@@ -121,7 +123,7 @@ func FetchAllDoTables(ctx context.Context, db *sql.DB, bw *filter.Filter) (map[s
 }
 
 // FetchTargetDoTables returns all need to do tables after filtered and routed (fetches from upstream MySQL).
-func FetchTargetDoTables(ctx context.Context, db *sql.DB, bw *filter.Filter, router *router.Table) (map[string][]*filter.Table, error) {
+func FetchTargetDoTables(ctx context.Context, db *sql.DB, bw *filter.Filter, router *regexprrouter.RouteTable) (map[string][]*filter.Table, error) {
 	// fetch tables from source and filter them
 	sourceTables, err := FetchAllDoTables(ctx, db, bw)
 
@@ -182,12 +184,13 @@ func FetchLowerCaseTableNamesSetting(ctx context.Context, conn *sql.Conn) (Lower
 	return LowerCaseTableNamesFlavor(res), nil
 }
 
-// GetDBCaseSensitive returns the case sensitive setting of target db.
+// GetDBCaseSensitive returns the case-sensitive setting of target db.
 func GetDBCaseSensitive(ctx context.Context, db *sql.DB) (bool, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return true, terror.DBErrorAdapt(err, terror.ErrDBDriverError)
 	}
+	defer conn.Close()
 	lcFlavor, err := FetchLowerCaseTableNamesSetting(ctx, conn)
 	if err != nil {
 		return true, err
@@ -324,51 +327,50 @@ func (se *session) GetBuiltinFunctionUsage() map[string]uint32 {
 	return se.builtinFunctionUsage
 }
 
-// UTCSession can be used as a sessionctx.Context, with UTC timezone.
-var UTCSession *session
+func (se *session) BuiltinFunctionUsageInc(scalarFuncSigName string) {}
 
-func init() {
-	UTCSession = &session{}
-	vars := variable.NewSessionVars()
-	vars.StmtCtx.TimeZone = time.UTC
-	UTCSession.vars = vars
-	UTCSession.values = make(map[fmt.Stringer]interface{}, 1)
-	UTCSession.builtinFunctionUsage = make(map[string]uint32)
+// ZeroSessionCtx is used when the session variables is not important.
+var ZeroSessionCtx sessionctx.Context
+
+// NewSessionCtx return a session context with specified session variables.
+func NewSessionCtx(vars map[string]string) sessionctx.Context {
+	variables := variable.NewSessionVars()
+	for k, v := range vars {
+		_ = variables.SetSystemVar(k, v)
+		if strings.EqualFold(k, "time_zone") {
+			loc, _ := ParseTimeZone(v)
+			variables.StmtCtx.TimeZone = loc
+		}
+	}
+
+	return &session{
+		vars:                 variables,
+		values:               make(map[fmt.Stringer]interface{}, 1),
+		builtinFunctionUsage: make(map[string]uint32),
+	}
 }
 
 // AdjustBinaryProtocolForDatum converts the data in binlog to TiDB datum.
-func AdjustBinaryProtocolForDatum(data []interface{}, cols []*model.ColumnInfo) ([]types.Datum, error) {
-	log.L().Debug("AdjustBinaryProtocolForChunk",
-		zap.Any("data", data),
-		zap.Any("columns", cols))
+func AdjustBinaryProtocolForDatum(ctx sessionctx.Context, data []interface{}, cols []*model.ColumnInfo) ([]types.Datum, error) {
 	ret := make([]types.Datum, 0, len(data))
 	for i, d := range data {
-		switch v := d.(type) {
-		case int8:
-			d = int64(v)
-		case int16:
-			d = int64(v)
-		case int32:
-			d = int64(v)
-		case uint8:
-			d = uint64(v)
-		case uint16:
-			d = uint64(v)
-		case uint32:
-			d = uint64(v)
-		case uint:
-			d = uint64(v)
-		case decimal.Decimal:
-			d = v.String()
-		}
 		datum := types.NewDatum(d)
-
-		// TODO: should we use timezone of upstream?
-		castDatum, err := table.CastValue(UTCSession, datum, cols[i], false, false)
+		castDatum, err := table.CastValue(ctx, datum, cols[i], false, false)
 		if err != nil {
 			return nil, err
 		}
 		ret = append(ret, castDatum)
 	}
 	return ret, nil
+}
+
+// GoLogWrapper go routine wrapper, log error on panic.
+func GoLogWrapper(logger log.Logger, fn func()) {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Error("routine panic", zap.Any("err", err))
+		}
+	}()
+
+	fn()
 }

@@ -15,20 +15,33 @@ package model
 
 import (
 	"encoding/json"
-	"fmt"
 	"time"
 
-	"github.com/pingcap/ticdc/pkg/config"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/config"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
 )
+
+const timeFormat = `"2006-01-02 15:04:05.000"`
 
 // JSONTime used to wrap time into json format
 type JSONTime time.Time
 
-// MarshalJSON use to specify the time format
+// MarshalJSON used to specify the time format
 func (t JSONTime) MarshalJSON() ([]byte, error) {
-	stamp := fmt.Sprintf("\"%s\"", time.Time(t).Format("2006-01-02 15:04:05.000"))
+	stamp := time.Time(t).Format(timeFormat)
 	return []byte(stamp), nil
+}
+
+// UnmarshalJSON is used to parse time.Time from bytes. The builtin json.Unmarshal function cannot unmarshal
+// a date string formatted as "2006-01-02 15:04:05.000", so we must implement a customized unmarshal function.
+func (t *JSONTime) UnmarshalJSON(data []byte) error {
+	tm, err := time.Parse(timeFormat, string(data))
+	if err != nil {
+		return err
+	}
+
+	*t = JSONTime(tm)
+	return nil
 }
 
 // HTTPError of cdc http api
@@ -57,6 +70,7 @@ type ServerStatus struct {
 
 // ChangefeedCommonInfo holds some common usage information of a changefeed
 type ChangefeedCommonInfo struct {
+	Namespace      string        `json:"namespace"`
 	ID             string        `json:"id"`
 	FeedState      FeedState     `json:"state"`
 	CheckpointTSO  uint64        `json:"checkpoint_tso"`
@@ -80,10 +94,12 @@ func (c ChangefeedCommonInfo) MarshalJSON() ([]byte, error) {
 
 // ChangefeedDetail holds detail info of a changefeed
 type ChangefeedDetail struct {
+	Namespace      string              `json:"namespace"`
 	ID             string              `json:"id"`
 	SinkURI        string              `json:"sink_uri"`
 	CreateTime     JSONTime            `json:"create_time"`
 	StartTs        uint64              `json:"start_ts"`
+	ResolvedTs     uint64              `json:"resolved_ts"`
 	TargetTs       uint64              `json:"target_ts"`
 	CheckpointTSO  uint64              `json:"checkpoint_tso"`
 	CheckpointTime JSONTime            `json:"checkpoint_time"`
@@ -111,10 +127,11 @@ func (c ChangefeedDetail) MarshalJSON() ([]byte, error) {
 
 // ChangefeedConfig use to create a changefeed
 type ChangefeedConfig struct {
-	ID       string `json:"changefeed_id"`
-	StartTS  uint64 `json:"start_ts"`
-	TargetTS uint64 `json:"target_ts"`
-	SinkURI  string `json:"sink_uri"`
+	Namespace string `json:"namespace"`
+	ID        string `json:"changefeed_id"`
+	StartTS   uint64 `json:"start_ts"`
+	TargetTS  uint64 `json:"target_ts"`
+	SinkURI   string `json:"sink_uri"`
 	// timezone used when checking sink uri
 	TimeZone string `json:"timezone" default:"system"`
 	// if true, force to replicate some ineligible tables
@@ -128,6 +145,7 @@ type ChangefeedConfig struct {
 
 // ProcessorCommonInfo holds the common info of a processor
 type ProcessorCommonInfo struct {
+	Namespace string `json:"namespace"`
 	CfID      string `json:"changefeed_id"`
 	CaptureID string `json:"capture_id"`
 }
@@ -140,6 +158,8 @@ type ProcessorDetail struct {
 	ResolvedTs uint64 `json:"resolved_ts"`
 	// all table ids that this processor are replicating
 	Tables []int64 `json:"table_ids"`
+	// The count of events that have been replicated.
+	Count uint64 `json:"count"`
 	// Error code when error happens
 	Error *RunningError `json:"error"`
 }
